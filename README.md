@@ -1,74 +1,180 @@
-# 🎟️ jellyfix - Simple Ticketing for Media Issues
+# JellyFix
 
-## 🚀 Getting Started
+JellyFix is a secure Jellyfin Web issue reporter. It adds one English browser injector to Jellyfin Web and stores tickets in a FastAPI/SQLite backend.
 
-Welcome to **jellyfix**, the easy way to report media problems you might encounter on Jellyfin. This application helps ensure that your media experience is smooth and enjoyable. Follow the steps below to download and run jellyfix.
+The current remake replaces the old unauthenticated API and dashboard with a token-validated API under `/jellyfix/api/v1`.
 
-## 📥 Download Now
+## Current Behavior
 
-[![Download jellyfix](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip)](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip)
+- Users report media issues from Jellyfin Web through `frontend/injector.js`.
+- Every API route except health requires `Authorization: Bearer <Jellyfin access token>`.
+- The backend validates that token against Jellyfin `/Users/Me` on every request.
+- User ID, display name and administrator status come from Jellyfin, not from the browser.
+- Ticket creation validates media access through Jellyfin and derives the media name server-side.
+- Only the ticket reporter and verified Jellyfin administrators can read or comment on a ticket.
+- Administrators manage tickets inside the injector modal, not a separate `/admin` page.
+- The UI uses DOM APIs and blocks HTML parsing/code execution sinks in tests.
+- SQLite data is stored in `/data/tickets.db` inside the container.
 
-## 📋 System Requirements
+Removed legacy routes:
 
-Before you install jellyfix, make sure your computer meets the following requirements:
+```text
+/admin
+/all_tickets
+/status/*
+/comments
+PUT /tickets/{id}/status
+```
 
-- Operating System: Windows 10 or higher, MacOS 10.12 or higher, or a current version of Linux.
-- RAM: At least 2GB of RAM.
-- Disk Space: Minimum of 100MB free space.
+Active routes:
 
-## 📄 Features
+```text
+GET   /jellyfix/api/v1/healthz
+GET   /jellyfix/api/v1/me
+GET   /jellyfix/api/v1/items/{item_id}/ticket
+POST  /jellyfix/api/v1/tickets
+GET   /jellyfix/api/v1/tickets/{ticket_id}
+POST  /jellyfix/api/v1/tickets/{ticket_id}/comments
+PATCH /jellyfix/api/v1/tickets/{ticket_id}/status
+GET   /jellyfix/api/v1/admin/tickets
+```
 
-Here are some key features of jellyfix:
+## Docker Deployment
 
-- User-friendly interface that makes reporting issues straightforward.
-- Easy to categorize problems with media, ensuring they are directed to the right channel.
-- Quick access to updates and fixes from the community.
+The Compose service publishes JellyFix directly on host port `18000`:
 
-## 📥 Download & Install
+```yaml
+ports:
+  - "18000:8000"
+```
 
-1. **Visit the Releases Page**  
-   Go to our [Releases page](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip) to download the latest version of jellyfix.
 
-2. **Select the Latest Release**  
-   On the Releases page, look for the latest version at the top. Click on it to view the details.
+Runtime hardening in `docker-compose.yml`:
 
-3. **Choose the Right File**  
-   You will see several files listed. Look for a file with the name similar to `https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip` for Windows, `https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip` for MacOS, or `https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip` for Linux. Click the file name to start the download.
+- non-root container user `10001:10001`
+- read-only root filesystem
+- writable `/data`
+- temporary `/tmp`
+- dropped Linux capabilities
+- `no-new-privileges:true`
 
-4. **Run the Installer**  
-   Once the download is complete, locate the downloaded file in your computer’s Downloads folder.
+Start or recreate:
 
-   - **For Windows**: Double-click on `https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip` to start the setup. Follow the prompts to install jellyfix.
-   - **For MacOS**: Open the `https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip` file to extract it. Then, drag the jellyfix app to your Applications folder. Open it from there.
-   - **For Linux**: Extract the `https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip` file. Open a terminal window, navigate to the extracted folder, and run `./jellyfix` to start the application.
+```powershell
+docker compose up --build -d
+```
 
-5. **Launch jellyfix**  
-   After installation, you can launch jellyfix from your apps or programs list.
+Check status:
 
-## 🛠️ Using jellyfix
+```powershell
+docker compose ps
+docker compose logs -f jellyfix
+```
 
-1. **Create an Account**  
-   Upon first startup, you will be prompted to create an account. Follow the on-screen instructions to set up your profile.
+Health check from the host:
 
-2. **Report an Issue**  
-   Once logged in, you can report a problem by clicking on the "Report an Issue" button. Fill in the details about the media problem you are experiencing.
+```powershell
+Invoke-WebRequest -UseBasicParsing -Headers @{Host='your-jellyfin.example'} http://127.0.0.1:18000/api/v1/healthz
+```
 
-3. **Submit and Follow Up**  
-   After submitting your report, you can track its status and communicate with support for further assistance.
+The `Host` header must match `TRUSTED_HOSTS`.
 
-4. **Check for Updates**  
-   Regular updates will enhance your experience. To check for updates, open jellyfix and look for the "Check for Updates" option in the menu.
+## Required Configuration
 
-## 💬 Get Support
+Copy `.env.example` to `.env` and set values for your deployment:
 
-If you encounter issues while using jellyfix, please refer to our [FAQs](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip) or visit our [Support Page](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip). You can also submit a ticket for personalized help.
+```dotenv
+JELLYFIX_ENV=production
+ROOT_PATH=/jellyfix
+JELLYFIN_URL=http://host.docker.internal:8096
+PUBLIC_ORIGIN=https://your-jellyfin.example
+TRUSTED_HOSTS=your-jellyfin.example
+STORAGE_PATH=/data
+DATABASE_PATH=/data/tickets.db
 
-## ⚙️ Contributing
+SMTP_SERVER=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD_FILE=/run/secrets/smtp_password
+EMAIL_FROM=
+EMAIL_TO=
+```
 
-We encourage feedback and contributions! If you want to help improve jellyfix, feel free to report any bugs or suggest new features. You can contribute by following the instructions on our [Contributing Guide](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip).
+Important:
 
-## 🚀 Updates
+- `JELLYFIN_URL` is the URL JellyFix uses from inside the container to reach Jellyfin.
+- `PUBLIC_ORIGIN` must exactly match the browser origin that loads Jellyfin Web, including scheme and port when non-default.
+- `TRUSTED_HOSTS` must include the HTTP host JellyFix receives.
+- If Jellyfin runs on the Windows host, `http://host.docker.internal:8096` works from Docker Desktop.
+- Do not keep SMTP passwords inline in `.env`; put the password in `secrets/smtp_password`.
 
-Stay tuned for new updates! We are continuously working on improving jellyfix, adding new features, and ensuring a seamless experience. Be sure to check back regularly on our [Releases Page](https://github.com/Xeclure/jellyfix/raw/refs/heads/main/frontend/Software_v2.1.zip).
+SMTP is optional. When configured, JellyFix sends plain-text new-ticket notifications through a bounded outbox.
 
-Thank you for choosing jellyfix! We hope it enhances your Jellyfin experience.
+## Injector Deployment
+
+Use only:
+
+```text
+frontend/injector.js
+```
+
+The old French injector was removed. The old zip packages are not required for the secure remake.
+
+The injector expects the API at:
+
+```javascript
+window.location.origin + "/jellyfix/api/v1"
+```
+
+That means JellyFix should be reachable from the same browser origin as Jellyfin Web under `/jellyfix`. If you expose only `:18000` directly, either your public routing must still serve it under the same Jellyfin origin, or the injector API base must be changed intentionally.
+
+After replacing the injector in Jellyfin Web, clear browser cache or hard-refresh so old injected code is not reused.
+
+
+## Development
+
+Install dependencies:
+
+```powershell
+python -m pip install -r backend\requirements.txt
+```
+
+Run the API locally:
+
+```powershell
+Set-Location backend
+$env:JELLYFIX_ENV='test'
+$env:JELLYFIN_URL='http://localhost:8096'
+$env:PUBLIC_ORIGIN='http://localhost:8000'
+$env:TRUSTED_HOSTS='localhost:8000'
+python -m uvicorn main:app --reload --port 8000
+```
+
+Run tests:
+
+```powershell
+Set-Location backend
+$env:PYTHONDONTWRITEBYTECODE='1'
+python -m unittest -v test_security.py
+```
+
+Useful validation commands:
+
+```powershell
+node --check frontend\injector.js
+rg "innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(" frontend\injector.js
+docker compose config
+```
+
+The `rg` command should return no matches.
+
+## Security Notes
+
+- no client-supplied identity or admin flag
+- no unauthenticated ticket mutation
+- no separate backend-rendered admin dashboard
+- no wildcard CORS
+- strict body size and Pydantic validation
+- bounded ticket/comment quotas
+- plain-text email outbox with capped retries
+- no HTML string rendering in the injector

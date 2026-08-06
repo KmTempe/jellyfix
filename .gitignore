@@ -1,5 +1,6 @@
-backend/tickets.db
 __pycache__/
 *.py[cod]
+.pycache-check/
 .env
 jellyfin_credentials
+reports/
