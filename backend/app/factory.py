@@ -14,6 +14,7 @@ from .database import Database
 from .notifications import outbox_worker
 from .repositories import TicketRepository
 from .routes import router
+from .wizarr import WizarrEmailLookup
 
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -25,10 +26,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     db.init()
     ticket_repo = TicketRepository(settings)
     jellyfin_client = JellyfinClient(settings)
+    wizarr_email_lookup = WizarrEmailLookup(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.outbox_task = asyncio.create_task(outbox_worker(app.state.db, settings))
+        app.state.outbox_task = asyncio.create_task(
+            outbox_worker(app.state.db, settings, app.state.wizarr_email_lookup)
+        )
         try:
             yield
         finally:
@@ -51,6 +55,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.db = db
     app.state.ticket_repo = ticket_repo
     app.state.jellyfin_client = jellyfin_client
+    app.state.wizarr_email_lookup = wizarr_email_lookup
     app.state.outbox_task = None
 
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.trusted_hosts))

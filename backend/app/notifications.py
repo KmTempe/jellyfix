@@ -11,6 +11,7 @@ from pathlib import Path
 from .config import Settings
 from .database import Database
 from .repositories import iso, utcnow
+from .wizarr import ReplyToUnavailable, WizarrEmailLookup
 
 
 RETRY_DELAYS = [timedelta(minutes=1), timedelta(minutes=5), timedelta(minutes=30)]
@@ -32,6 +33,8 @@ def _message(settings: Settings, payload: dict) -> EmailMessage:
     msg["From"] = settings.email_from
     msg["To"] = settings.email_to
     msg["Subject"] = f"JellyFix ticket created: {payload['ticket_id']}"
+    if payload.get("reply_to"):
+        msg["Reply-To"] = payload["reply_to"]
     body = (
         "A new JellyFix ticket was created.\n\n"
         f"Ticket: {payload['ticket_id']}\n"
@@ -68,7 +71,7 @@ def send_creation_email(settings: Settings, payload: dict) -> None:
             server.send_message(message)
 
 
-def process_outbox_once(db: Database, settings: Settings) -> int:
+def process_outbox_once(db: Database, settings: Settings, wizarr_email_lookup: WizarrEmailLookup) -> int:
     sent = 0
     now = iso(utcnow())
     with db.transaction() as conn:
@@ -96,6 +99,15 @@ def process_outbox_once(db: Database, settings: Settings) -> int:
     for row in rows:
         try:
             payload = json.loads(row["payload"])
+            if payload.get("reply_to_required") and not payload.get("reply_to"):
+                payload["reply_to"] = wizarr_email_lookup.lookup(
+                    str(payload.get("reporter_id") or ""), str(payload.get("reporter_name") or "")
+                )
+                with db.transaction() as conn:
+                    conn.execute(
+                        "UPDATE notification_outbox SET payload = ?, updated_at = ? WHERE id = ?",
+                        (json.dumps(payload, ensure_ascii=True), iso(utcnow()), row["id"]),
+                    )
             send_creation_email(settings, payload)
             with db.transaction() as conn:
                 conn.execute(
@@ -103,6 +115,16 @@ def process_outbox_once(db: Database, settings: Settings) -> int:
                     (iso(utcnow()), row["id"]),
                 )
             sent += 1
+        except ReplyToUnavailable as exc:
+            with db.transaction() as conn:
+                conn.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET next_attempt_at = ?, status = 'pending', last_error = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (iso(utcnow() + timedelta(minutes=1)), _redact_error(exc), iso(utcnow()), row["id"]),
+                )
         except Exception as exc:
             attempt = int(row["attempt_count"]) + 1
             if attempt > len(RETRY_DELAYS):
@@ -123,10 +145,10 @@ def process_outbox_once(db: Database, settings: Settings) -> int:
     return sent
 
 
-async def outbox_worker(db: Database, settings: Settings) -> None:
+async def outbox_worker(db: Database, settings: Settings, wizarr_email_lookup: WizarrEmailLookup) -> None:
     while True:
         try:
-            await asyncio.to_thread(process_outbox_once, db, settings)
+            await asyncio.to_thread(process_outbox_once, db, settings, wizarr_email_lookup)
         except Exception:
             pass
         await asyncio.sleep(5)

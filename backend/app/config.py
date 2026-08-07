@@ -41,6 +41,12 @@ class Settings:
     smtp_messages_per_hour: int
     outbox_pending_cap: int
     allow_active_ticket_deletion: bool
+    resolved_ticket_cooldown_seconds: int
+    wizarr_base_url: str
+    wizarr_token_file: str
+    wizarr_timeout_seconds: float
+    wizarr_cache_ttl_seconds: int
+    wizarr_reply_to_required: bool
 
     @property
     def is_production(self) -> bool:
@@ -121,5 +127,13 @@ def load_settings() -> Settings:
         outbox_pending_cap=int(os.getenv("OUTBOX_PENDING_CAP", "500")),
         allow_active_ticket_deletion=_bool(
             "ALLOW_ACTIVE_TICKET_DELETION", os.getenv("ALLOW_ACTIVE_TICKET_DELETION", "false")
+        ),
+        resolved_ticket_cooldown_seconds=int(os.getenv("RESOLVED_TICKET_COOLDOWN_SECONDS", "300")),
+        wizarr_base_url=os.getenv("WIZARR_BASE_URL", "").rstrip("/"),
+        wizarr_token_file=os.getenv("WIZARR_TOKEN_FILE", ""),
+        wizarr_timeout_seconds=float(os.getenv("WIZARR_TIMEOUT_SECONDS", "5")),
+        wizarr_cache_ttl_seconds=int(os.getenv("WIZARR_CACHE_TTL_SECONDS", "300")),
+        wizarr_reply_to_required=_bool(
+            "WIZARR_REPLY_TO_REQUIRED", os.getenv("WIZARR_REPLY_TO_REQUIRED", "false")
         ),
     )

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import base64
+import math
+import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -18,6 +21,29 @@ def utcnow() -> datetime:
 
 def iso(dt: datetime) -> str:
     return dt.isoformat(timespec="seconds")
+
+
+def parse_iso(value: str) -> datetime:
+    return datetime.fromisoformat(value).astimezone(timezone.utc)
+
+
+def encode_cursor(created_at: str, ticket_id: str) -> str:
+    raw = json.dumps({"created_at": created_at, "id": ticket_id}, separators=(",", ":"), ensure_ascii=True)
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def decode_cursor(cursor: str) -> tuple[str, str]:
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8"))
+        created_at = str(payload["created_at"])
+        ticket_id = str(payload["id"])
+        parse_iso(created_at)
+        if not ticket_id:
+            raise ValueError("empty ticket id")
+        return created_at, ticket_id
+    except (KeyError, ValueError, TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid cursor") from exc
 
 
 def row_to_dict(row: Any) -> dict[str, Any] | None:
@@ -48,13 +74,34 @@ class TicketRepository:
     def current_user_ticket_for_item(self, conn, item_id: str, user: UserContext) -> dict[str, Any] | None:
         ticket = row_to_dict(
             conn.execute(
-                "SELECT * FROM tickets WHERE reporter_id = ? AND jellyfin_item_id = ?",
+                """
+                SELECT * FROM tickets
+                WHERE reporter_id = ? AND jellyfin_item_id = ? AND status IN ('new', 'in_progress')
+                LIMIT 1
+                """,
                 (user.user_id, item_id),
             ).fetchone()
         )
-        if not ticket:
+        if ticket:
+            return {"ticket": ticket}
+        resolved = row_to_dict(
+            conn.execute(
+                """
+                SELECT * FROM tickets
+                WHERE reporter_id = ? AND jellyfin_item_id = ? AND status = 'resolved' AND resolved_at IS NOT NULL
+                ORDER BY resolved_at DESC, id DESC
+                LIMIT 1
+                """,
+                (user.user_id, item_id),
+            ).fetchone()
+        )
+        if not resolved:
             return None
-        return {"ticket": ticket}
+        expiry = parse_iso(resolved["resolved_at"]) + timedelta(seconds=self.settings.resolved_ticket_cooldown_seconds)
+        if utcnow() >= expiry:
+            return None
+        resolved["cooldown_expires_at"] = iso(expiry)
+        return {"ticket": resolved}
 
     def create_ticket(
         self,
@@ -64,10 +111,16 @@ class TicketRepository:
         issue_type: str,
         message: str,
         client_ip: str,
+        reply_to: str | None = None,
+        reply_to_required: bool = False,
     ) -> dict[str, str]:
         existing = row_to_dict(
             conn.execute(
-                "SELECT id FROM tickets WHERE reporter_id = ? AND jellyfin_item_id = ?",
+                """
+                SELECT id FROM tickets
+                WHERE reporter_id = ? AND jellyfin_item_id = ? AND status IN ('new', 'in_progress')
+                LIMIT 1
+                """,
                 (user.user_id, media.item_id),
             ).fetchone()
         )
@@ -76,6 +129,35 @@ class TicketRepository:
                 status_code=409,
                 detail={"message": "Ticket already exists", "ticket_id": existing["id"]},
             )
+
+        resolved = row_to_dict(
+            conn.execute(
+                """
+                SELECT id, resolved_at FROM tickets
+                WHERE reporter_id = ? AND jellyfin_item_id = ? AND status = 'resolved' AND resolved_at IS NOT NULL
+                ORDER BY resolved_at DESC, id DESC
+                LIMIT 1
+                """,
+                (user.user_id, media.item_id),
+            ).fetchone()
+        )
+        if resolved:
+            cooldown_expires_at = parse_iso(resolved["resolved_at"]) + timedelta(
+                seconds=self.settings.resolved_ticket_cooldown_seconds
+            )
+            remaining = (cooldown_expires_at - utcnow()).total_seconds()
+            if remaining > 0:
+                retry_after = max(1, math.ceil(remaining))
+                raise HTTPException(
+                    status_code=429,
+                    detail={
+                        "message": "Recently resolved ticket cooldown is active",
+                        "ticket_id": resolved["id"],
+                        "cooldown_expires_at": iso(cooldown_expires_at),
+                        "retry_after": retry_after,
+                    },
+                    headers={"Retry-After": str(retry_after)},
+                )
 
         open_count = conn.execute(
             "SELECT COUNT(*) FROM tickets WHERE reporter_id = ? AND status != 'resolved'",
@@ -97,14 +179,32 @@ class TicketRepository:
         comment_id = str(uuid.uuid4())
         event_id = str(uuid.uuid4())
         outbox_id = str(uuid.uuid4())
-        conn.execute(
-            """
-            INSERT INTO tickets
-            (id, reporter_id, reporter_name, jellyfin_item_id, item_name, issue_type, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)
-            """,
-            (ticket_id, user.user_id, user.name, media.item_id, media.item_name, issue_type, now, now),
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO tickets
+                (id, reporter_id, reporter_name, jellyfin_item_id, item_name, issue_type, status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'new', ?, ?)
+                """,
+                (ticket_id, user.user_id, user.name, media.item_id, media.item_name, issue_type, now, now),
+            )
+        except sqlite3.IntegrityError as exc:
+            concurrent = row_to_dict(
+                conn.execute(
+                    """
+                    SELECT id FROM tickets
+                    WHERE reporter_id = ? AND jellyfin_item_id = ? AND status IN ('new', 'in_progress')
+                    LIMIT 1
+                    """,
+                    (user.user_id, media.item_id),
+                ).fetchone()
+            )
+            if concurrent:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"message": "Ticket already exists", "ticket_id": concurrent["id"]},
+                ) from exc
+            raise
         conn.execute(
             """
             INSERT INTO comments
@@ -121,16 +221,18 @@ class TicketRepository:
             """,
             (event_id, ticket_id, user.user_id, user.name, now),
         )
-        payload = json.dumps(
-            {
-                "ticket_id": ticket_id,
-                "item_name": media.item_name,
-                "issue_type": issue_type,
-                "reporter_name": user.name,
-                "message": message,
-            },
-            ensure_ascii=True,
-        )
+        notification_payload = {
+            "ticket_id": ticket_id,
+            "item_name": media.item_name,
+            "issue_type": issue_type,
+            "reporter_name": user.name,
+            "reporter_id": user.user_id,
+            "message": message,
+            "reply_to_required": reply_to_required,
+        }
+        if reply_to:
+            notification_payload["reply_to"] = reply_to
+        payload = json.dumps(notification_payload, ensure_ascii=True)
         conn.execute(
             """
             INSERT INTO notification_outbox
@@ -182,16 +284,21 @@ class TicketRepository:
         if status not in allowed[before]:
             raise HTTPException(status_code=409, detail="Invalid status transition")
 
+        self._ensure_reopen_is_available(conn, ticket, status)
+
         now = iso(utcnow())
         resolved_at = now if status == "resolved" else None
-        conn.execute(
-            """
-            UPDATE tickets
-            SET status = ?, updated_at = ?, resolved_at = ?, version = version + 1
-            WHERE id = ?
-            """,
-            (status, now, resolved_at, ticket_id),
-        )
+        try:
+            conn.execute(
+                """
+                UPDATE tickets
+                SET status = ?, updated_at = ?, resolved_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (status, now, resolved_at, ticket_id),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="Another active ticket already exists for this media") from exc
         conn.execute(
             """
             INSERT INTO status_events
@@ -256,15 +363,19 @@ class TicketRepository:
                 continue
             if status not in allowed[before]:
                 raise HTTPException(status_code=409, detail="Invalid status transition")
+            self._ensure_reopen_is_available(conn, ticket, status)
             resolved_at = now if status == "resolved" else None
-            conn.execute(
-                """
-                UPDATE tickets
-                SET status = ?, updated_at = ?, resolved_at = ?, version = version + 1
-                WHERE id = ?
-                """,
-                (status, now, resolved_at, ticket_id),
-            )
+            try:
+                conn.execute(
+                    """
+                    UPDATE tickets
+                    SET status = ?, updated_at = ?, resolved_at = ?, version = version + 1
+                    WHERE id = ?
+                    """,
+                    (status, now, resolved_at, ticket_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail="Another active ticket already exists for this media") from exc
             conn.execute(
                 """
                 INSERT INTO status_events
@@ -275,6 +386,46 @@ class TicketRepository:
             )
             changed_ids.append(ticket_id)
         return {"status": status, "updated_ids": changed_ids}
+
+    @staticmethod
+    def _ensure_reopen_is_available(conn, ticket: dict[str, Any], target_status: str) -> None:
+        if ticket["status"] != "resolved" or target_status not in {"new", "in_progress"}:
+            return
+        active = conn.execute(
+            """
+            SELECT 1 FROM tickets
+            WHERE reporter_id = ? AND jellyfin_item_id = ? AND status IN ('new', 'in_progress') AND id != ?
+            LIMIT 1
+            """,
+            (ticket["reporter_id"], ticket["jellyfin_item_id"], ticket["id"]),
+        ).fetchone()
+        if active:
+            raise HTTPException(status_code=409, detail="Another active ticket already exists for this media")
+
+    def my_tickets(self, conn, user: UserContext, cursor: str | None, limit: int) -> dict[str, Any]:
+        limit = min(max(limit, 1), 100)
+        params: list[Any] = [user.user_id]
+        where = ["reporter_id = ?"]
+        if cursor:
+            created_at, ticket_id = decode_cursor(cursor)
+            where.append("(created_at < ? OR (created_at = ? AND id < ?))")
+            params.extend([created_at, created_at, ticket_id])
+        rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT id, jellyfin_item_id, item_name, issue_type, status, created_at, updated_at, resolved_at
+                FROM tickets
+                WHERE """
+                + " AND ".join(where)
+                + " ORDER BY created_at DESC, id DESC LIMIT ?",
+                [*params, limit + 1],
+            ).fetchall()
+        ]
+        has_more = len(rows) > limit
+        tickets = rows[:limit]
+        next_cursor = encode_cursor(tickets[-1]["created_at"], tickets[-1]["id"]) if has_more else None
+        return {"tickets": tickets, "next_cursor": next_cursor}
 
     def admin_tickets(self, conn, user: UserContext, status: str | None, cursor: str | None, limit: int) -> dict[str, Any]:
         if not user.is_admin:

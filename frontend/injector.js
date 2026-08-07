@@ -18,6 +18,7 @@
         report: "Report Issue",
         ticket: "Ticket",
         manager: "Ticket Manager",
+        history: "My Ticket History",
         send: "Send",
         close: "Close",
         details: "Details",
@@ -28,6 +29,8 @@
         noTickets: "No tickets found.",
         loadError: "Unable to load JellyFix.",
         duplicate: "A ticket already exists for this media.",
+        cooldown: "This ticket was recently resolved. You can create a new report in {time}.",
+        loadMore: "Load more",
         inProgress: "Set in progress",
         resolve: "Resolve",
         reopen: "Reopen",
@@ -54,6 +57,7 @@
     let ticketPollTimer = null;
     let ticketPollAbort = null;
     let ticketPollInFlight = false;
+    let cooldownTimer = null;
 
     function addStyles() {
         if (document.getElementById("jellyfix-style")) return;
@@ -171,6 +175,23 @@
         openTicket = null;
     }
 
+    function scheduleCooldownRefresh(ticket) {
+        if (cooldownTimer) window.clearTimeout(cooldownTimer);
+        cooldownTimer = null;
+        if (!ticket?.cooldown_expires_at || ticket.status !== "resolved") return;
+        const delay = new Date(ticket.cooldown_expires_at).getTime() - Date.now();
+        if (!Number.isFinite(delay)) return;
+        cooldownTimer = window.setTimeout(() => {
+            invalidateTicketButton();
+            refreshButton();
+        }, Math.max(delay + 100, 100));
+    }
+
+    function cooldownMessage(expiresAt) {
+        const seconds = Math.max(0, Math.ceil((new Date(expiresAt).getTime() - Date.now()) / 1000));
+        return TEXT.cooldown.replace("{time}", `${seconds}s`);
+    }
+
     function ticketModalIsOpen(ticketId) {
         const overlay = document.getElementById("jellyfix-overlay");
         return overlay?.style.display === "flex" && openTicket?.id === ticketId;
@@ -209,6 +230,17 @@
                         : TEXT.duplicate
             );
             err.ticketId = detail?.ticket_id;
+            throw err;
+        }
+        if (response.status === 429) {
+            const data = await response.json().catch(() => ({}));
+            const detail = data.detail;
+            const err = new Error(
+                typeof detail === "object" && detail?.message ? detail.message : `JellyFix returned 429`
+            );
+            err.ticketId = detail?.ticket_id;
+            err.cooldownExpiresAt = detail?.cooldown_expires_at;
+            err.retryAfter = Number(response.headers.get("Retry-After") || detail?.retry_after || 0);
             throw err;
         }
         if (!response.ok) throw new Error(`JellyFix returned ${response.status}`);
@@ -376,9 +408,13 @@
         if (resolvedNote) {
             clear(resolvedNote);
             if (ticket.status === "resolved" && !meCache?.is_admin) {
-                resolvedNote.appendChild(el("div", "jellyfix-muted", TEXT.resolved));
+                const message = ticket.cooldown_expires_at
+                    ? cooldownMessage(ticket.cooldown_expires_at)
+                    : TEXT.resolved;
+                resolvedNote.appendChild(el("div", "jellyfix-muted", message));
             }
         }
+        scheduleCooldownRefresh(ticket);
         renderCommentFooter(ticket);
     }
 
@@ -642,6 +678,80 @@
         }
     }
 
+    async function showHistory() {
+        showModal(TEXT.history);
+        try {
+            await loadMe();
+            const content = document.getElementById("jf-content");
+            let cursor = null;
+            let loading = false;
+            const loadPage = async () => {
+                if (loading) return;
+                loading = true;
+                try {
+                    const suffix = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+                    const data = await api(`/tickets/mine?limit=50${suffix}`, { signal: resetAbort() });
+                    if (!data.tickets?.length && !cursor) {
+                        content.appendChild(el("div", "jellyfix-muted", TEXT.noTickets));
+                        return;
+                    }
+                    for (const ticket of data.tickets || []) {
+                        const row = el("div", "jellyfix-ticket-row");
+                        const info = el("div");
+                        info.appendChild(el("div", null, ticket.item_name));
+                        info.appendChild(el("div", "jellyfix-muted", ticket.issue_type));
+                        info.appendChild(el("div", "jellyfix-status", ticket.status));
+                        const open = el("button", "jellyfix-btn", "Open");
+                        open.type = "button";
+                        open.addEventListener("click", () => showTicket(ticket.id));
+                        row.append(info, open);
+                        content.appendChild(row);
+                    }
+                    cursor = data.next_cursor || null;
+                    const previousMore = document.getElementById("jf-history-more");
+                    if (previousMore) previousMore.remove();
+                    if (cursor) {
+                        const more = el("button", "jellyfix-btn", TEXT.loadMore);
+                        more.id = "jf-history-more";
+                        more.type = "button";
+                        more.addEventListener("click", loadPage);
+                        content.appendChild(more);
+                    }
+                } finally {
+                    loading = false;
+                }
+            };
+            await loadPage();
+        } catch (err) {
+            showError(err.message);
+        }
+    }
+
+    async function injectHistoryMenu() {
+        try {
+            await loadMe();
+        } catch (_err) {
+            return;
+        }
+        if (document.getElementById("btn-jellyfix-history")) return;
+        const link = document.createElement("a");
+        link.id = "btn-jellyfix-history";
+        link.href = "#";
+        link.setAttribute("role", "button");
+        link.className = "navMenuOption";
+        const icon = el("span", "navMenuOptionIcon material-icons", "history");
+        icon.setAttribute("aria-hidden", "true");
+        const text = el("span", "navMenuOptionText", TEXT.history);
+        link.append(icon, text);
+        link.addEventListener("click", (event) => {
+            event.preventDefault();
+            showHistory();
+        });
+        const dashboardLink = document.querySelector('a[href*="dashboard"]');
+        if (dashboardLink?.parentNode) dashboardLink.parentNode.insertBefore(link, dashboardLink.nextSibling);
+        else (document.querySelector(".mainDrawer-content") || document.querySelector(".mainDrawer-scrollContainer"))?.appendChild(link);
+    }
+
     async function injectAdminMenu() {
         try {
             await loadMe();
@@ -720,6 +830,7 @@
 
     async function refreshButton() {
         if (refreshInFlight) return;
+        await injectHistoryMenu();
         await injectAdminMenu();
         const container = document.querySelector(".mainDetailButtons");
         if (!container) return;
@@ -734,6 +845,7 @@
             let ticket = null;
             const data = await api(`/items/${itemId}/ticket`, { signal: activeAbort?.signal });
             ticket = data.ticket;
+            scheduleCooldownRefresh(ticket);
             if (currentPageItemId() === itemId && button.isConnected) {
                 renderTicketButton(button, itemId, ticket);
                 button.dataset.jellyfixLoaded = "true";

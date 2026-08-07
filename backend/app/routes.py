@@ -15,6 +15,7 @@ from .models import (
     TicketStatus,
 )
 from .repositories import TicketRepository
+from .wizarr import ReplyToUnavailable, WizarrEmailLookup
 
 
 router = APIRouter(prefix="/api/v1")
@@ -26,6 +27,10 @@ def get_db(request: Request) -> Database:
 
 def get_repo(request: Request) -> TicketRepository:
     return request.app.state.ticket_repo
+
+
+def get_wizarr_email_lookup(request: Request) -> WizarrEmailLookup:
+    return request.app.state.wizarr_email_lookup
 
 
 def client_ip(request: Request) -> str:
@@ -74,6 +79,7 @@ def create_ticket(
     db: Database = Depends(get_db),
     repo: TicketRepository = Depends(get_repo),
     jellyfin: JellyfinClient = Depends(get_jellyfin_client),
+    wizarr_email_lookup: WizarrEmailLookup = Depends(get_wizarr_email_lookup),
 ):
     try:
         media = jellyfin.validate_media(user.token, user.user_id, payload.item_id)
@@ -81,6 +87,15 @@ def create_ticket(
         raise HTTPException(status_code=404, detail="Media not found") from exc
     except JellyfinUnavailable as exc:
         raise HTTPException(status_code=503, detail="Jellyfin media validation unavailable") from exc
+
+    reply_to = None
+    reply_to_required = request.app.state.settings.wizarr_reply_to_required
+    if wizarr_email_lookup.enabled:
+        try:
+            reply_to = wizarr_email_lookup.lookup(user.user_id, user.name)
+        except ReplyToUnavailable:
+            # The durable outbox will retry this lookup before sending the notification.
+            pass
 
     with db.transaction() as conn:
         return repo.create_ticket(
@@ -90,7 +105,21 @@ def create_ticket(
             issue_type=payload.issue_type.value if hasattr(payload.issue_type, "value") else str(payload.issue_type),
             message=payload.message,
             client_ip=client_ip(request),
+            reply_to=reply_to,
+            reply_to_required=reply_to_required,
         )
+
+
+@router.get("/tickets/mine")
+def my_tickets(
+    cursor: str | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=100),
+    user: UserContext = Depends(get_current_user),
+    db: Database = Depends(get_db),
+    repo: TicketRepository = Depends(get_repo),
+):
+    with db.connect() as conn:
+        return repo.my_tickets(conn, user, cursor, limit)
 
 
 @router.get("/tickets/{ticket_id}")
