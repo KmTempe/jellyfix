@@ -4,6 +4,24 @@ JellyFix is a secure Jellyfin Web issue reporter. It adds one English browser in
 
 The current remake replaces the old unauthenticated API and dashboard with a token-validated API under `/jellyfix/api/v1`.
 
+## Architecture diagram
+```mermaid
+flowchart LR
+    Browser["Jellyfin Web + injector.js"]
+    Proxy["Nginx Proxy Manager"]
+    API["JellyFix API"]
+    Jellyfin["Jellyfin API"]
+    DB["SQLite + audit/outbox"]
+    SMTP["SMTP server"]
+
+    Browser -->|"Bearer Jellyfin token"| Proxy
+    Proxy --> API
+    API -->|"Validate token: /Users/Me"| Jellyfin
+    API -->|"Validate media: /Items/{id}"| Jellyfin
+    API --> DB
+    DB -->|"Bounded outbox worker"| SMTP
+```
+
 ## Current Behavior
 
 - Users report media issues from Jellyfin Web through `frontend/injector.js`.
@@ -36,6 +54,9 @@ POST  /jellyfix/api/v1/tickets
 GET   /jellyfix/api/v1/tickets/{ticket_id}
 POST  /jellyfix/api/v1/tickets/{ticket_id}/comments
 PATCH /jellyfix/api/v1/tickets/{ticket_id}/status
+PATCH /jellyfix/api/v1/tickets/status                         # JSON body: {"ticket_ids":[...],"status":"resolved"}
+DELETE /jellyfix/api/v1/tickets/{ticket_id}
+DELETE /jellyfix/api/v1/tickets                         # JSON body: {"ticket_ids":[...]}, max 100
 GET   /jellyfix/api/v1/admin/tickets
 ```
 
@@ -91,6 +112,7 @@ PUBLIC_ORIGIN=https://your-jellyfin.example
 TRUSTED_HOSTS=your-jellyfin.example
 STORAGE_PATH=/data
 DATABASE_PATH=/data/tickets.db
+ALLOW_ACTIVE_TICKET_DELETION=false
 
 SMTP_SERVER=
 SMTP_PORT=587
@@ -107,6 +129,7 @@ Important:
 - `TRUSTED_HOSTS` must include the HTTP host JellyFix receives.
 - If Jellyfin runs on the Windows host, `http://host.docker.internal:8096` works from Docker Desktop.
 - Do not keep SMTP passwords inline in `.env`; put the password in `secrets/smtp_password`.
+- Ticket deletion is administrator-only. By default, only resolved tickets can be deleted; set `ALLOW_ACTIVE_TICKET_DELETION=true` only when administrators must also delete new or in-progress tickets.
 
 SMTP is optional. When configured, JellyFix sends plain-text new-ticket notifications through a bounded outbox.
 
@@ -118,7 +141,7 @@ Use only:
 frontend/injector.js
 ```
 
-The old French injector was removed. The old zip packages are not required for the secure remake.
+For convenience use javascript injector plugin from https://github.com/n00bcodr/Jellyfin-JavaScript-Injector
 
 The injector expects the API at:
 
@@ -129,6 +152,7 @@ window.location.origin + "/jellyfix/api/v1"
 That means JellyFix should be reachable from the same browser origin as Jellyfin Web under `/jellyfix`. If you expose only `:18000` directly, either your public routing must still serve it under the same Jellyfin origin, or the injector API base must be changed intentionally.
 
 After replacing the injector in Jellyfin Web, clear browser cache or hard-refresh so old injected code is not reused.
+
 
 
 ## Development

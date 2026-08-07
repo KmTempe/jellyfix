@@ -202,6 +202,80 @@ class TicketRepository:
         )
         return {"id": ticket_id, "status": status}
 
+    def delete_tickets(self, conn, ticket_ids: list[str], user: UserContext) -> dict[str, list[str]]:
+        if not user.is_admin:
+            raise HTTPException(status_code=403, detail="Admin required")
+
+        placeholders = ", ".join("?" for _ticket_id in ticket_ids)
+        rows = conn.execute(f"SELECT id FROM tickets WHERE id IN ({placeholders})", ticket_ids).fetchall()
+        found_ids = {row["id"] for row in rows}
+        if len(found_ids) != len(ticket_ids):
+            raise HTTPException(status_code=404, detail="Ticket not found")
+
+        if not self.settings.allow_active_ticket_deletion:
+            active_ticket_ids = [
+                row["id"]
+                for row in conn.execute(
+                    f"SELECT id FROM tickets WHERE id IN ({placeholders}) AND status != 'resolved'", ticket_ids
+                ).fetchall()
+            ]
+            if active_ticket_ids:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "message": "Selected tickets include new or in-progress tickets. Resolve them first or enable active-ticket deletion.",
+                        "active_ticket_ids": active_ticket_ids,
+                    },
+                )
+
+        # Foreign-key cascades remove comments, status events, and unsent outbox entries atomically.
+        conn.execute(f"DELETE FROM tickets WHERE id IN ({placeholders})", ticket_ids)
+        return {"deleted_ids": ticket_ids}
+
+    def bulk_update_status(self, conn, ticket_ids: list[str], user: UserContext, status: str) -> dict[str, list[str] | str]:
+        if not user.is_admin:
+            raise HTTPException(status_code=403, detail="Admin required")
+
+        placeholders = ", ".join("?" for _ticket_id in ticket_ids)
+        rows = conn.execute(f"SELECT * FROM tickets WHERE id IN ({placeholders})", ticket_ids).fetchall()
+        tickets = {row["id"]: dict(row) for row in rows}
+        if len(tickets) != len(ticket_ids):
+            raise HTTPException(status_code=404, detail="Ticket not found")
+
+        allowed = {
+            "new": {"in_progress", "resolved"},
+            "in_progress": {"resolved"},
+            "resolved": {"in_progress"},
+        }
+        now = iso(utcnow())
+        changed_ids = []
+        for ticket_id in ticket_ids:
+            ticket = tickets[ticket_id]
+            before = ticket["status"]
+            if before == status:
+                continue
+            if status not in allowed[before]:
+                raise HTTPException(status_code=409, detail="Invalid status transition")
+            resolved_at = now if status == "resolved" else None
+            conn.execute(
+                """
+                UPDATE tickets
+                SET status = ?, updated_at = ?, resolved_at = ?, version = version + 1
+                WHERE id = ?
+                """,
+                (status, now, resolved_at, ticket_id),
+            )
+            conn.execute(
+                """
+                INSERT INTO status_events
+                (id, ticket_id, actor_id, actor_name, before_status, after_status, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (str(uuid.uuid4()), ticket_id, user.user_id, user.name, before, status, now),
+            )
+            changed_ids.append(ticket_id)
+        return {"status": status, "updated_ids": changed_ids}
+
     def admin_tickets(self, conn, user: UserContext, status: str | None, cursor: str | None, limit: int) -> dict[str, Any]:
         if not user.is_admin:
             raise HTTPException(status_code=403, detail="Admin required")

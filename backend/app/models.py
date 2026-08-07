@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, validator
 ITEM_ID_RE = re.compile(
     r"^(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})$"
 )
+TICKET_ID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
 
 class IssueType(str, Enum):
@@ -49,3 +50,26 @@ class CommentCreate(StrictModel):
 
 class StatusUpdate(StrictModel):
     status: TicketStatus
+
+
+class TicketDeleteBatch(StrictModel):
+    ticket_ids: list[str] = Field(..., min_length=1, max_length=100)
+
+    @validator("ticket_ids")
+    def validate_ticket_ids(cls, ticket_ids: list[str]) -> list[str]:
+        normalized = [value.lower() for value in ticket_ids]
+        if any(not TICKET_ID_RE.fullmatch(value) for value in normalized):
+            raise ValueError("ticket_ids must contain UUIDs")
+        if len(set(normalized)) != len(normalized):
+            raise ValueError("ticket_ids must be unique")
+        return normalized
+
+
+class TicketBatchStatusUpdate(TicketDeleteBatch):
+    status: TicketStatus
+
+    @validator("status")
+    def validate_batch_status(cls, value: TicketStatus | str) -> TicketStatus | str:
+        if value == TicketStatus.new or value == "new":
+            raise ValueError("Bulk status updates must target in_progress or resolved")
+        return value

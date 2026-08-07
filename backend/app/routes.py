@@ -4,7 +4,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from .auth import JellyfinClient, JellyfinUnauthorized, JellyfinUnavailable, UserContext, get_current_user, get_jellyfin_client
 from .database import Database
-from .models import ITEM_ID_RE, CommentCreate, StatusUpdate, TicketCreate, TicketStatus
+from .models import (
+    ITEM_ID_RE,
+    TICKET_ID_RE,
+    CommentCreate,
+    StatusUpdate,
+    TicketBatchStatusUpdate,
+    TicketCreate,
+    TicketDeleteBatch,
+    TicketStatus,
+)
 from .repositories import TicketRepository
 
 
@@ -34,8 +43,13 @@ def healthz():
 
 
 @router.get("/me")
-def me(user: UserContext = Depends(get_current_user)):
-    return {"id": user.user_id, "name": user.name, "is_admin": user.is_admin}
+def me(request: Request, user: UserContext = Depends(get_current_user)):
+    return {
+        "id": user.user_id,
+        "name": user.name,
+        "is_admin": user.is_admin,
+        "allow_active_ticket_deletion": user.is_admin and request.app.state.settings.allow_active_ticket_deletion,
+    }
 
 
 @router.get("/items/{item_id}/ticket")
@@ -114,6 +128,42 @@ def update_status(
     status = payload.status.value if hasattr(payload.status, "value") else str(payload.status)
     with db.transaction() as conn:
         return repo.update_status(conn, ticket_id, user, status)
+
+
+@router.patch("/tickets/status")
+def bulk_update_status(
+    payload: TicketBatchStatusUpdate,
+    user: UserContext = Depends(get_current_user),
+    db: Database = Depends(get_db),
+    repo: TicketRepository = Depends(get_repo),
+):
+    status = payload.status.value if hasattr(payload.status, "value") else str(payload.status)
+    with db.transaction() as conn:
+        return repo.bulk_update_status(conn, payload.ticket_ids, user, status)
+
+
+@router.delete("/tickets")
+def delete_tickets(
+    payload: TicketDeleteBatch,
+    user: UserContext = Depends(get_current_user),
+    db: Database = Depends(get_db),
+    repo: TicketRepository = Depends(get_repo),
+):
+    with db.transaction() as conn:
+        return repo.delete_tickets(conn, payload.ticket_ids, user)
+
+
+@router.delete("/tickets/{ticket_id}")
+def delete_ticket(
+    ticket_id: str,
+    user: UserContext = Depends(get_current_user),
+    db: Database = Depends(get_db),
+    repo: TicketRepository = Depends(get_repo),
+):
+    if not TICKET_ID_RE.fullmatch(ticket_id):
+        raise HTTPException(status_code=422, detail="Invalid ticket ID")
+    with db.transaction() as conn:
+        return repo.delete_tickets(conn, [ticket_id], user)
 
 
 @router.get("/admin/tickets")

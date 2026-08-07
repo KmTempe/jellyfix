@@ -40,6 +40,7 @@ class Settings:
     smtp_timeout_seconds: float
     smtp_messages_per_hour: int
     outbox_pending_cap: int
+    allow_active_ticket_deletion: bool
 
     @property
     def is_production(self) -> bool:
@@ -57,6 +58,15 @@ def _origin(value: str) -> str:
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.path not in {"", "/"}:
         raise RuntimeError("PUBLIC_ORIGIN must be an absolute origin like https://example.com")
     return f"{parsed.scheme}://{parsed.netloc}".rstrip("/")
+
+
+def _bool(name: str, value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise RuntimeError(f"{name} must be true or false")
 
 
 def load_settings() -> Settings:
@@ -109,4 +119,7 @@ def load_settings() -> Settings:
         smtp_timeout_seconds=float(os.getenv("SMTP_TIMEOUT_SECONDS", "10")),
         smtp_messages_per_hour=int(os.getenv("SMTP_MESSAGES_PER_HOUR", "20")),
         outbox_pending_cap=int(os.getenv("OUTBOX_PENDING_CAP", "500")),
+        allow_active_ticket_deletion=_bool(
+            "ALLOW_ACTIVE_TICKET_DELETION", os.getenv("ALLOW_ACTIVE_TICKET_DELETION", "false")
+        ),
     )

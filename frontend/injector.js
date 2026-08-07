@@ -6,6 +6,7 @@
     "use strict";
 
     const API_BASE = `${window.location.origin}/jellyfix/api/v1`;
+    const TICKET_POLL_INTERVAL_MS = 5000;
     const ISSUE_TYPES = [
         ["audio", "Audio"],
         ["subtitles", "Subtitles"],
@@ -30,6 +31,15 @@
         inProgress: "Set in progress",
         resolve: "Resolve",
         reopen: "Reopen",
+        delete: "Delete",
+        selectAll: "Select all",
+        deleteSelected: "Delete selected",
+        deleteConfirm: "Delete this ticket permanently? This cannot be undone.",
+        deleteSelectedConfirm: "Delete the selected tickets permanently? This cannot be undone.",
+        updateStatus: "Update status",
+        chooseStatus: "Choose status",
+        setInProgress: "Set in progress / reopen",
+        deleteActiveDisabled: "Resolve this ticket before deleting it.",
         statusNew: "New",
         statusProgress: "In progress",
         statusResolved: "Resolved"
@@ -40,6 +50,10 @@
     let meCache = null;
     let observerTimer = null;
     let refreshInFlight = false;
+    let openTicket = null;
+    let ticketPollTimer = null;
+    let ticketPollAbort = null;
+    let ticketPollInFlight = false;
 
     function addStyles() {
         if (document.getElementById("jellyfix-style")) return;
@@ -63,7 +77,11 @@
             .jellyfix-label { display:flex; flex-direction:column; gap:6px; color:#ddd; }
             .jellyfix-row { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
             .jellyfix-ticket-row { display:grid; grid-template-columns:1fr auto; gap:10px; align-items:center; border:1px solid #333; border-radius:6px; padding:10px; background:#202020; }
+            .jellyfix-ticket-actions { display:flex; align-items:center; gap:8px; }
+            .jellyfix-ticket-select { width:18px; height:18px; }
+            .jellyfix-danger { background:#c62828; }
             .jellyfix-status { color:#ccc; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+            .jellyfix-comments { display:flex; flex-direction:column; gap:12px; }
             .jellyfix-comment { max-width:82%; padding:10px 12px; border-radius:8px; background:#333; align-self:flex-start; white-space:pre-wrap; word-break:break-word; }
             .jellyfix-comment-admin { background:#006f98; align-self:flex-end; }
             .jellyfix-comment-meta { display:block; margin-bottom:5px; color:rgba(255,255,255,.72); font-size:12px; }
@@ -144,6 +162,20 @@
         return activeAbort.signal;
     }
 
+    function stopTicketPolling() {
+        if (ticketPollTimer) window.clearInterval(ticketPollTimer);
+        ticketPollTimer = null;
+        if (ticketPollAbort) ticketPollAbort.abort();
+        ticketPollAbort = null;
+        ticketPollInFlight = false;
+        openTicket = null;
+    }
+
+    function ticketModalIsOpen(ticketId) {
+        const overlay = document.getElementById("jellyfix-overlay");
+        return overlay?.style.display === "flex" && openTicket?.id === ticketId;
+    }
+
     function invalidateTicketButton() {
         const button = document.getElementById("btn-jellyfix");
         if (button) delete button.dataset.jellyfixLoaded;
@@ -168,8 +200,15 @@
         if (response.status === 401) throw new Error(TEXT.authExpired);
         if (response.status === 409) {
             const data = await response.json().catch(() => ({}));
-            const err = new Error(TEXT.duplicate);
-            err.ticketId = data.detail?.ticket_id;
+            const detail = data.detail;
+            const err = new Error(
+                typeof detail === "object" && detail?.message
+                    ? detail.message
+                    : typeof detail === "string"
+                        ? detail
+                        : TEXT.duplicate
+            );
+            err.ticketId = detail?.ticket_id;
             throw err;
         }
         if (!response.ok) throw new Error(`JellyFix returned ${response.status}`);
@@ -207,6 +246,7 @@
     }
 
     function showModal(title) {
+        stopTicketPolling();
         const overlay = ensureModal();
         document.getElementById("jf-title").textContent = title;
         clear(document.getElementById("jf-content"));
@@ -216,6 +256,7 @@
     }
 
     function hideModal() {
+        stopTicketPolling();
         resetAbort();
         invalidateTicketButton();
         const overlay = document.getElementById("jellyfix-overlay");
@@ -312,35 +353,131 @@
         if (actions.length > 0) content.appendChild(row);
     }
 
+    function commentBubble(comment) {
+        const bubble = el("div", comment.is_admin ? "jellyfix-comment jellyfix-comment-admin" : "jellyfix-comment");
+        const meta = el("span", "jellyfix-comment-meta", `${comment.author_name} - ${new Date(comment.created_at).toLocaleString()}`);
+        const msg = el("span", null, comment.message);
+        bubble.dataset.commentId = comment.id;
+        bubble.append(meta, msg);
+        return bubble;
+    }
+
+    function updateTicketStatus(ticket) {
+        const status = document.getElementById("jf-ticket-status");
+        if (status) status.textContent = ticket.status;
+
+        const controls = document.getElementById("jf-status-controls");
+        if (controls) {
+            clear(controls);
+            appendStatusControls(controls, ticket);
+        }
+
+        const resolvedNote = document.getElementById("jf-resolved-note");
+        if (resolvedNote) {
+            clear(resolvedNote);
+            if (ticket.status === "resolved" && !meCache?.is_admin) {
+                resolvedNote.appendChild(el("div", "jellyfix-muted", TEXT.resolved));
+            }
+        }
+        renderCommentFooter(ticket);
+    }
+
+    function renderTicket(ticket, comments) {
+        const title = document.getElementById("jf-title");
+        title.textContent = `${TEXT.ticket}: ${ticket.item_name}`;
+        const content = document.getElementById("jf-content");
+        clear(content);
+
+        const status = el("div", "jellyfix-status", ticket.status);
+        status.id = "jf-ticket-status";
+        const controls = el("div");
+        controls.id = "jf-status-controls";
+        const resolvedNote = el("div");
+        resolvedNote.id = "jf-resolved-note";
+        const commentsContainer = el("div", "jellyfix-comments");
+        commentsContainer.id = "jf-comments";
+        for (const comment of comments) commentsContainer.appendChild(commentBubble(comment));
+        content.append(status, controls, resolvedNote, commentsContainer);
+
+        openTicket = {
+            id: ticket.id,
+            status: ticket.status,
+            commentIds: new Set(comments.map((comment) => comment.id))
+        };
+        updateTicketStatus(ticket);
+        content.scrollTop = content.scrollHeight;
+    }
+
+    async function refreshOpenTicket(ticketId) {
+        if (ticketPollInFlight || document.hidden || !ticketModalIsOpen(ticketId)) return;
+        ticketPollInFlight = true;
+        ticketPollAbort = new AbortController();
+        try {
+            const data = await api(`/tickets/${ticketId}`, { signal: ticketPollAbort.signal });
+            if (!ticketModalIsOpen(ticketId)) return;
+
+            const ticket = data.ticket;
+            const comments = data.comments || [];
+            const previous = openTicket;
+            if (ticket.status !== previous.status) {
+                previous.status = ticket.status;
+                updateTicketStatus(ticket);
+                invalidateTicketButton();
+            }
+
+            const commentsContainer = document.getElementById("jf-comments");
+            const content = document.getElementById("jf-content");
+            const wasAtBottom = content && content.scrollHeight - content.scrollTop - content.clientHeight < 48;
+            let addedComment = false;
+            for (const comment of comments) {
+                if (!previous.commentIds.has(comment.id) && commentsContainer) {
+                    commentsContainer.appendChild(commentBubble(comment));
+                    previous.commentIds.add(comment.id);
+                    addedComment = true;
+                }
+            }
+            if (addedComment && wasAtBottom && content) content.scrollTop = content.scrollHeight;
+        } catch (_err) {
+            // A transient poll failure must not disrupt an open ticket or the user's draft reply.
+        } finally {
+            ticketPollInFlight = false;
+            ticketPollAbort = null;
+        }
+    }
+
+    function startTicketPolling(ticketId) {
+        ticketPollTimer = window.setInterval(() => refreshOpenTicket(ticketId), TICKET_POLL_INTERVAL_MS);
+    }
+
     async function showTicket(ticketId) {
         showModal(TEXT.ticket);
         try {
             await loadMe();
             const data = await api(`/tickets/${ticketId}`, { signal: resetAbort() });
             const ticket = data.ticket;
-            const comments = data.comments || [];
-            const title = document.getElementById("jf-title");
-            title.textContent = `${TEXT.ticket}: ${ticket.item_name}`;
-            const content = document.getElementById("jf-content");
-            clear(content);
-            const status = el("div", "jellyfix-status", ticket.status);
-            content.appendChild(status);
-            appendStatusControls(content, ticket);
-            if (ticket.status === "resolved" && !meCache.is_admin) {
-                content.appendChild(el("div", "jellyfix-muted", TEXT.resolved));
-            }
-            for (const comment of comments) {
-                const bubble = el("div", comment.is_admin ? "jellyfix-comment jellyfix-comment-admin" : "jellyfix-comment");
-                const meta = el("span", "jellyfix-comment-meta", `${comment.author_name} - ${new Date(comment.created_at).toLocaleString()}`);
-                const msg = el("span", null, comment.message);
-                bubble.append(meta, msg);
-                content.appendChild(bubble);
-            }
-            content.scrollTop = content.scrollHeight;
-            renderCommentFooter(ticket);
+            renderTicket(ticket, data.comments || []);
+            startTicketPolling(ticketId);
         } catch (err) {
             showError(err.message);
         }
+    }
+
+    async function deleteTickets(ticketIds) {
+        await api("/tickets", {
+            method: "DELETE",
+            body: { ticket_ids: ticketIds },
+            signal: resetAbort()
+        });
+        invalidateTicketButton();
+    }
+
+    async function updateTicketsStatus(ticketIds, status) {
+        await api("/tickets/status", {
+            method: "PATCH",
+            body: { ticket_ids: ticketIds, status },
+            signal: resetAbort()
+        });
+        invalidateTicketButton();
     }
 
     function renderCommentFooter(ticket) {
@@ -387,16 +524,117 @@
                 content.appendChild(el("div", "jellyfix-muted", TEXT.noTickets));
                 return;
             }
+            const selectedIds = new Set();
+            const checkboxes = [];
+            const ticketById = new Map(data.tickets.map((ticket) => [ticket.id, ticket]));
+            const toolbar = el("div", "jellyfix-row");
+            const selectAll = el("input", "jellyfix-ticket-select");
+            selectAll.type = "checkbox";
+            selectAll.id = "jf-select-all";
+            const selectAllLabel = el("label", null, TEXT.selectAll);
+            selectAllLabel.htmlFor = selectAll.id;
+            const deleteSelected = el("button", "jellyfix-btn jellyfix-danger", TEXT.deleteSelected);
+            deleteSelected.type = "button";
+            deleteSelected.disabled = true;
+            const statusSelect = el("select", "jellyfix-select");
+            statusSelect.style.width = "auto";
+            const statusPlaceholder = el("option", null, TEXT.chooseStatus);
+            statusPlaceholder.value = "";
+            statusPlaceholder.disabled = true;
+            statusPlaceholder.selected = true;
+            const inProgress = el("option", null, TEXT.setInProgress);
+            inProgress.value = "in_progress";
+            const resolved = el("option", null, TEXT.resolve);
+            resolved.value = "resolved";
+            statusSelect.append(statusPlaceholder, inProgress, resolved);
+            const updateStatus = el("button", "jellyfix-btn", TEXT.updateStatus);
+            updateStatus.type = "button";
+            updateStatus.disabled = true;
+            const updateSelection = () => {
+                const selectedCount = selectedIds.size;
+                const containsActiveTicket = Array.from(selectedIds).some(
+                    (ticketId) => ticketById.get(ticketId)?.status !== "resolved"
+                );
+                deleteSelected.disabled = selectedCount === 0 || (
+                    containsActiveTicket && !meCache?.allow_active_ticket_deletion
+                );
+                deleteSelected.title = deleteSelected.disabled && containsActiveTicket
+                    ? TEXT.deleteActiveDisabled
+                    : "";
+                updateStatus.disabled = selectedCount === 0 || !statusSelect.value;
+                selectAll.checked = checkboxes.length > 0 && selectedCount === checkboxes.length;
+                selectAll.indeterminate = selectedCount > 0 && selectedCount < checkboxes.length;
+            };
+            selectAll.addEventListener("change", () => {
+                for (const checkbox of checkboxes) {
+                    checkbox.checked = selectAll.checked;
+                    if (checkbox.checked) selectedIds.add(checkbox.dataset.ticketId);
+                    else selectedIds.delete(checkbox.dataset.ticketId);
+                }
+                updateSelection();
+            });
+            statusSelect.addEventListener("change", updateSelection);
+            deleteSelected.addEventListener("click", async () => {
+                if (!selectedIds.size || !window.confirm(TEXT.deleteSelectedConfirm)) return;
+                deleteSelected.disabled = true;
+                try {
+                    await deleteTickets(Array.from(selectedIds));
+                    await showManager();
+                } catch (err) {
+                    showError(err.message);
+                }
+            });
+            updateStatus.addEventListener("click", async () => {
+                const status = statusSelect.value;
+                if (!selectedIds.size || !status) return;
+                updateStatus.disabled = true;
+                try {
+                    await updateTicketsStatus(Array.from(selectedIds), status);
+                    await showManager();
+                } catch (err) {
+                    showError(err.message);
+                }
+            });
+            toolbar.append(selectAll, selectAllLabel, statusSelect, updateStatus, deleteSelected);
+            content.appendChild(toolbar);
             for (const ticket of data.tickets) {
                 const row = el("div", "jellyfix-ticket-row");
                 const info = el("div");
                 info.appendChild(el("div", null, ticket.item_name));
                 info.appendChild(el("div", "jellyfix-muted", `${ticket.reporter_name} - ${ticket.issue_type}`));
                 info.appendChild(el("div", "jellyfix-status", ticket.status));
+                const actions = el("div", "jellyfix-ticket-actions");
+                const select = el("input", "jellyfix-ticket-select");
+                select.type = "checkbox";
+                select.dataset.ticketId = ticket.id;
+                select.setAttribute("aria-label", `Select ${ticket.item_name}`);
+                select.addEventListener("change", () => {
+                    if (select.checked) selectedIds.add(ticket.id);
+                    else selectedIds.delete(ticket.id);
+                    updateSelection();
+                });
+                checkboxes.push(select);
                 const open = el("button", "jellyfix-btn", "Open");
                 open.type = "button";
                 open.addEventListener("click", () => showTicket(ticket.id));
-                row.append(info, open);
+                const remove = el("button", "jellyfix-btn jellyfix-danger", TEXT.delete);
+                remove.type = "button";
+                if (ticket.status !== "resolved" && !meCache?.allow_active_ticket_deletion) {
+                    remove.disabled = true;
+                    remove.title = TEXT.deleteActiveDisabled;
+                }
+                remove.addEventListener("click", async () => {
+                    if (!window.confirm(TEXT.deleteConfirm)) return;
+                    remove.disabled = true;
+                    try {
+                        await deleteTickets([ticket.id]);
+                        await showManager();
+                    } catch (err) {
+                        showError(err.message);
+                    }
+                });
+                actions.append(select, open, remove);
+                row.append(info, actions);
                 content.appendChild(row);
             }
         } catch (err) {
@@ -416,15 +654,19 @@
             return;
         }
         if (existing) return;
-        const link = document.createElement("button");
+        const link = document.createElement("a");
         link.id = "btn-admin-tickets";
-        link.type = "button";
-        link.className = "navMenuOption emby-button";
+        link.href = "#";
+        link.setAttribute("role", "button");
+        link.className = "navMenuOption";
         const icon = el("span", "navMenuOptionIcon material-icons", "build");
         icon.setAttribute("aria-hidden", "true");
         const text = el("span", "navMenuOptionText", TEXT.manager);
         link.append(icon, text);
-        link.addEventListener("click", showManager);
+        link.addEventListener("click", (event) => {
+            event.preventDefault();
+            showManager();
+        });
         const dashboardLink = document.querySelector('a[href*="dashboard"]');
         if (dashboardLink?.parentNode) dashboardLink.parentNode.insertBefore(link, dashboardLink.nextSibling);
         else (document.querySelector(".mainDrawer-content") || document.querySelector(".mainDrawer-scrollContainer"))?.appendChild(link);
@@ -514,6 +756,7 @@
         if (window.location.href !== lastHref) {
             lastHref = window.location.href;
             resetAbort();
+            stopTicketPolling();
             currentItemId = null;
         }
         if (document.querySelector(".mainDetailButtons") || document.querySelector(".mainDrawer-content")) {
@@ -521,5 +764,8 @@
         }
     });
     observer.observe(document, { childList: true, subtree: true });
+    document.addEventListener("visibilitychange", () => {
+        if (!document.hidden && openTicket) refreshOpenTicket(openTicket.id);
+    });
     window.setTimeout(refreshButton, 800);
 })();
