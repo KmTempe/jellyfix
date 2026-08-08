@@ -63,13 +63,16 @@ class JellyfinClient:
             with self.opener.open(request, timeout=self.settings.jellyfin_timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            if exc.code in {301, 302, 303, 307, 308}:
-                raise JellyfinUnavailable("Jellyfin redirected validation request") from exc
-            if exc.code in {401, 403}:
-                raise JellyfinUnauthorized("Jellyfin rejected token") from exc
-            if exc.code == 404:
-                raise
-            raise JellyfinUnavailable("Jellyfin validation failed") from exc
+            try:
+                if exc.code in {301, 302, 303, 307, 308}:
+                    raise JellyfinUnavailable("Jellyfin redirected validation request") from exc
+                if exc.code in {401, 403}:
+                    raise JellyfinUnauthorized("Jellyfin rejected token") from exc
+                if exc.code == 404:
+                    raise
+                raise JellyfinUnavailable("Jellyfin validation failed") from exc
+            finally:
+                exc.close()
         except (OSError, TimeoutError, json.JSONDecodeError) as exc:
             raise JellyfinUnavailable("Jellyfin validation failed") from exc
 

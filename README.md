@@ -1,5 +1,7 @@
 # JellyFix
 
+[![CI and Container Release](https://github.com/KmTempe/jellyfix/actions/workflows/ci.yml/badge.svg)](https://github.com/KmTempe/jellyfix/actions/workflows/ci.yml)
+
 JellyFix adds issue reporting and ticket history to Jellyfin Web. A small browser injector talks to a FastAPI backend that validates Jellyfin users, stores tickets in SQLite, and synchronizes support conversations with LibreDesk.
 
 ## Features
@@ -208,7 +210,14 @@ docker compose up --build -d
 docker compose ps
 ```
 
-The Compose service exposes JellyFix on host port `18000`. Runtime data is stored in `backend/data` and mounted at `/data`.
+To use the published image instead of building locally:
+
+```powershell
+docker compose pull jellyfix
+docker compose up -d jellyfix
+```
+
+The public image is `ghcr.io/kmtempe/jellyfix:latest`. The Compose service exposes JellyFix on host port `18000`; runtime data is stored in `backend/data` and mounted at `/data`.
 
 Integration setup:
 

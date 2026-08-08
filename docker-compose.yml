@@ -1,6 +1,7 @@
 services:
   jellyfix:
     container_name: jellyfix
+    image: ghcr.io/kmtempe/jellyfix:latest
     build:
       context: ./backend
       dockerfile: Dockerfile

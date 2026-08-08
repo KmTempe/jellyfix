@@ -58,6 +58,8 @@ class WizarrEmailLookup:
                 payload = json.loads(response.read().decode("utf-8"))
             email = self._verified_email(payload, jellyfin_username)
         except (OSError, TimeoutError, urllib.error.HTTPError, json.JSONDecodeError, ValueError) as exc:
+            if isinstance(exc, urllib.error.HTTPError):
+                exc.close()
             LOGGER.warning("Wizarr Reply-To lookup unavailable (%s)", exc.__class__.__name__)
             raise ReplyToUnavailable("Wizarr Reply-To lookup unavailable") from exc
         ttl = max(self.settings.wizarr_cache_ttl_seconds, 0)
