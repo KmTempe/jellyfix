@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import sqlite3
 import tempfile
@@ -8,6 +10,7 @@ import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from dataclasses import replace
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -17,7 +20,8 @@ from app.auth import MediaContext, UserContext, get_current_user
 from app.config import load_settings
 from app.database import Database
 from app.factory import create_app
-from app.notifications import _message, process_outbox_once
+from app.libredesk import LibredeskClient
+from app.notifications import enqueue_webhook, process_inbox_once, process_outbox_once, reconcile_once, webhook_signature_valid
 from app.repositories import TicketRepository, iso
 from app.wizarr import ReplyToUnavailable, WizarrEmailLookup
 
@@ -29,6 +33,36 @@ ITEM_ID = "a" * 32
 class UnavailableWizarr:
     def lookup(self, _user_id: str, _username: str) -> str:
         raise ReplyToUnavailable("offline")
+
+
+class RecordingLibreDesk:
+    def __init__(self):
+        self.messages: list[dict] = []
+
+    def send_message(self, conversation_uuid: str, message: str, sender_type: str, echo_id: str) -> dict:
+        self.messages.append(
+            {
+                "conversation_uuid": conversation_uuid,
+                "message": message,
+                "sender_type": sender_type,
+                "echo_id": echo_id,
+            }
+        )
+        return {"uuid": "remote-message-1"}
+
+
+class ReconcileLibreDesk:
+    enabled = True
+
+    def __init__(self, status: str, updated_at: str):
+        self.status = status
+        self.updated_at = updated_at
+
+    def conversation(self, _conversation_uuid: str) -> dict:
+        return {"status": self.status, "updated_at": self.updated_at}
+
+    def messages(self, _conversation_uuid: str) -> list[dict]:
+        return []
 
 
 class TicketLifecycleTests(unittest.TestCase):
@@ -161,19 +195,12 @@ class TicketLifecycleTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"tickets": [], "next_cursor": None})
 
-    def test_reply_to_is_added_to_message_and_unavailable_lookup_keeps_outbox_pending(self):
-        message = _message(
-            self.settings,
-            {
-                "ticket_id": "ticket",
-                "item_name": "Media",
-                "issue_type": "other",
-                "reporter_name": "Member",
-                "message": "Report",
-                "reply_to": "member@example.com",
-            },
+    def test_wizarr_unavailable_keeps_libredesk_creation_pending_and_content_is_escaped(self):
+        content = LibredeskClient.initial_content(
+            {"ticket_id": "ticket", "item_name": "<Media>", "issue_type": "other", "reporter_name": "Member", "message": "<script>"}
         )
-        self.assertEqual(message["Reply-To"], "member@example.com")
+        self.assertIn("&lt;Media&gt;", content)
+        self.assertIn("&lt;script&gt;", content)
 
         ticket_id = self.add_ticket(status="new")
         with self.db.transaction() as conn:
@@ -187,17 +214,164 @@ class TicketLifecycleTests(unittest.TestCase):
                     str(uuid.uuid4()),
                     "reply-to-pending",
                     ticket_id,
-                    json.dumps({"ticket_id": ticket_id, "reporter_id": "member", "reply_to_required": True}),
+                    json.dumps({"ticket_id": ticket_id, "reporter_id": "member", "contact_email_required": True}),
                     iso(NOW),
                     iso(NOW),
                     iso(NOW),
                 ),
             )
         with patch("app.notifications.utcnow", return_value=NOW):
-            self.assertEqual(process_outbox_once(self.db, self.settings, UnavailableWizarr()), 0)
+            self.assertEqual(process_outbox_once(self.db, self.settings, UnavailableWizarr(), object()), 0)
         with self.db.connect() as conn:
             row = conn.execute("SELECT status, attempt_count FROM notification_outbox WHERE dedupe_key = 'reply-to-pending'").fetchone()
         self.assertEqual(dict(row), {"status": "pending", "attempt_count": 0})
+
+    def test_libredesk_webhook_signature_and_deduped_inbox(self):
+        secret_path = Path(self.temp_dir.name) / "webhook-secret"
+        secret_path.write_text("test-secret", encoding="utf-8")
+        settings = replace(self.settings, libredesk_webhook_secret_file=str(secret_path))
+        body = json.dumps({"event": "message.created", "payload": {"uuid": "remote-message"}}).encode("utf-8")
+        signature = "sha256=" + hmac.new(b"test-secret", body, hashlib.sha256).hexdigest()
+        self.assertTrue(webhook_signature_valid(settings, body, signature))
+        self.assertFalse(webhook_signature_valid(settings, body, "sha256=invalid"))
+        enqueue_webhook(self.db, body)
+        enqueue_webhook(self.db, body)
+        with self.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM integration_inbox").fetchone()[0], 1)
+
+    def test_reporter_admin_comment_syncs_as_contact_and_marks_sent(self):
+        ticket_id = self.add_ticket(reporter_id=self.admin.user_id, status="new")
+        comment_id = str(uuid.uuid4())
+        now = iso(NOW)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO ticket_integrations (ticket_id, provider, conversation_id, conversation_uuid, contact_email, created_at, updated_at) VALUES (?, 'libredesk', 1, 'conversation-1', 'member@example.com', ?, ?)",
+                (ticket_id, now, now),
+            )
+            conn.execute(
+                "INSERT INTO comments (id, ticket_id, author_id, author_name, is_admin, author_role, message, metadata_json, delivery_status, created_at) VALUES (?, ?, ?, ?, 0, 'reporter', 'Reply', '{}', 'pending', ?)",
+                (comment_id, ticket_id, self.admin.user_id, self.admin.name, now),
+            )
+            conn.execute(
+                "INSERT INTO notification_outbox (id, dedupe_key, ticket_id, event_type, payload, next_attempt_at, status, created_at, updated_at) VALUES (?, ?, ?, 'comment_created', ?, ?, 'pending', ?, ?)",
+                (str(uuid.uuid4()), f"comment-created:{comment_id}", ticket_id, json.dumps({"comment_id": comment_id, "message": "Reply", "sender_type": "agent"}), now, now, now),
+            )
+        libredesk = RecordingLibreDesk()
+        self.assertEqual(process_outbox_once(self.db, self.settings, UnavailableWizarr(), libredesk), 1)
+        self.assertEqual(libredesk.messages, [{"conversation_uuid": "conversation-1", "message": "Reply", "sender_type": "contact", "echo_id": comment_id}])
+        with self.db.connect() as conn:
+            outbox = conn.execute("SELECT status, payload FROM notification_outbox WHERE dedupe_key = ?", (f"comment-created:{comment_id}",)).fetchone()
+            comment = conn.execute("SELECT author_role, is_admin, delivery_status FROM comments WHERE id = ?", (comment_id,)).fetchone()
+        self.assertEqual(outbox["status"], "sent")
+        self.assertEqual(json.loads(outbox["payload"])["sender_type"], "contact")
+        self.assertEqual(dict(comment), {"author_role": "reporter", "is_admin": 0, "delivery_status": "sent"})
+
+    def test_admin_reply_to_another_reporter_is_an_agent(self):
+        ticket_id = self.add_ticket(reporter_id=self.member.user_id, status="new")
+        with self.db.transaction() as conn:
+            self.repo.add_comment(conn, ticket_id, self.admin, "Support reply", "127.0.0.1")
+            comment = conn.execute("SELECT author_role, is_admin FROM comments WHERE ticket_id = ?", (ticket_id,)).fetchone()
+            outbox = conn.execute("SELECT payload FROM notification_outbox WHERE ticket_id = ? AND event_type = 'comment_created'", (ticket_id,)).fetchone()
+        self.assertEqual(dict(comment), {"author_role": "agent", "is_admin": 1})
+        self.assertEqual(json.loads(outbox["payload"])["sender_type"], "agent")
+
+    def test_libredesk_agent_name_csat_link_and_private_note_handling(self):
+        ticket_id = self.add_ticket(status="new")
+        now = iso(NOW)
+        settings = replace(self.settings, libredesk_public_url="https://desk.example.test")
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO ticket_integrations (ticket_id, provider, conversation_id, conversation_uuid, contact_email, created_at, updated_at) VALUES (?, 'libredesk', 1, 'conversation-1', 'member@example.com', ?, ?)",
+                (ticket_id, now, now),
+            )
+        agent_event = {
+            "event": "message.created",
+            "payload": {
+                "uuid": "agent-message", "conversation_uuid": "conversation-1", "sender_id": 34,
+                "sender_type": "agent", "type": "outgoing", "private": False, "text_content": "Hello",
+                "author": {"id": 34, "type": "agent", "first_name": "Kosmas", "last_name": "Temperekidis"},
+            },
+        }
+        csat_event = {
+            "event": "message.created",
+            "payload": {
+                "uuid": "csat-message", "conversation_uuid": "conversation-1", "sender_id": 34,
+                "sender_type": "agent", "type": "outgoing", "private": False, "text_content": "Please rate this conversation",
+                "content": '<p>Please rate this conversation <a href="https://desk.example.test/csat/token">Rate</a></p>',
+                "meta": {"is_csat": True, "csat_uuid": "csat-1"},
+                "author": {"type": "agent", "first_name": "Kosmas", "last_name": "Temperekidis"},
+            },
+        }
+        private_event = {
+            "event": "message.created",
+            "payload": {"uuid": "private-message", "conversation_uuid": "conversation-1", "sender_type": "agent", "type": "outgoing", "private": True, "text_content": "Internal"},
+        }
+        for event in (agent_event, csat_event, private_event):
+            enqueue_webhook(self.db, json.dumps(event).encode("utf-8"))
+        self.assertEqual(process_inbox_once(self.db, settings), 3)
+        with self.db.connect() as conn:
+            comments = conn.execute("SELECT author_name, author_role, is_admin, message, metadata_json FROM comments WHERE ticket_id = ? ORDER BY created_at", (ticket_id,)).fetchall()
+        self.assertEqual(len(comments), 2)
+        self.assertEqual(dict(comments[0])["author_name"], "Kosmas Temperekidis")
+        self.assertEqual(dict(comments[0])["author_role"], "agent")
+        metadata = json.loads(comments[1]["metadata_json"])
+        self.assertEqual(metadata["kind"], "csat")
+        self.assertEqual(metadata["actions"], [{"label": "Rate this support", "url": "https://desk.example.test/csat/token"}])
+
+    def test_libredesk_message_payload_uses_echo_id_for_contact(self):
+        client = LibredeskClient(self.settings)
+        with patch.object(client, "_request", return_value={"uuid": "remote-message"}) as request:
+            self.assertEqual(client.send_message("conversation-1", "<reply>", "contact", "local-comment"), {"uuid": "remote-message"})
+        self.assertEqual(
+            request.call_args.kwargs["payload"],
+            {"message": "&lt;reply&gt;", "sender_type": "contact", "private": False, "echo_id": "local-comment"},
+        )
+
+    def test_repeated_libredesk_open_status_events_reopen_ticket_each_time(self):
+        ticket_id = self.add_ticket(status="new")
+        now = iso(NOW)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO ticket_integrations (ticket_id, provider, conversation_id, conversation_uuid, contact_email, created_at, updated_at) VALUES (?, 'libredesk', 1, 'conversation-1', 'member@example.com', ?, ?)",
+                (ticket_id, now, now),
+            )
+        for event_time, status in [
+            ("2026-08-07T00:00:01Z", "Resolved"),
+            ("2026-08-07T00:00:02Z", "Open"),
+            ("2026-08-07T00:00:03Z", "Closed"),
+            ("2026-08-07T00:00:04Z", "Open"),
+        ]:
+            enqueue_webhook(
+                self.db,
+                json.dumps(
+                    {
+                        "event": "conversation.status_changed",
+                        "timestamp": event_time,
+                        "payload": {"conversation_uuid": "conversation-1", "new_status": status},
+                    }
+                ).encode("utf-8"),
+            )
+            self.assertEqual(process_inbox_once(self.db, self.settings), 1)
+        with self.db.connect() as conn:
+            ticket = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+            events = conn.execute("SELECT after_status FROM status_events WHERE ticket_id = ? ORDER BY rowid", (ticket_id,)).fetchall()
+            mapping = conn.execute("SELECT last_remote_status_at FROM ticket_integrations WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        self.assertEqual(ticket["status"], "in_progress")
+        self.assertEqual([row["after_status"] for row in events], ["resolved", "in_progress", "resolved", "in_progress"])
+        self.assertEqual(mapping["last_remote_status_at"], "2026-08-07T00:00:04+00:00")
+
+    def test_reconciliation_repairs_a_status_mismatch_from_current_libredesk_state(self):
+        ticket_id = self.add_ticket(status="resolved")
+        now = iso(NOW)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO ticket_integrations (ticket_id, provider, conversation_id, conversation_uuid, contact_email, created_at, updated_at, last_remote_status_at) VALUES (?, 'libredesk', 1, 'conversation-1', 'member@example.com', ?, ?, ?)",
+                (ticket_id, now, now, "2026-08-07T00:00:01+00:00"),
+            )
+        reconcile_once(self.db, self.settings, ReconcileLibreDesk("Open", "2026-08-07T00:00:02Z"))
+        with self.db.connect() as conn:
+            ticket = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
+        self.assertEqual(ticket["status"], "in_progress")
 
     def test_wizarr_reply_to_requires_one_exact_jellyfin_username_and_valid_email(self):
         lookup = WizarrEmailLookup(self.settings)
@@ -267,10 +441,10 @@ class TicketMigrationTests(unittest.TestCase):
                 self.assertEqual(conn.execute("PRAGMA foreign_key_check").fetchall(), [])
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM comments").fetchone()[0], 1)
-                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 2)
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 5)
                 indexes = conn.execute("PRAGMA index_list('tickets')").fetchall()
                 self.assertTrue(any(row["name"] == "idx_tickets_active_reporter_item" for row in indexes))
-            backups = list(path.parent.glob("tickets.pre-lifecycle-v2-*.db"))
+            backups = list(path.parent.glob("tickets.pre-lifecycle-v5-*.db"))
             self.assertEqual(len(backups), 1)
             backup = sqlite3.connect(backups[0])
             try:
@@ -279,4 +453,4 @@ class TicketMigrationTests(unittest.TestCase):
             finally:
                 backup.close()
             db.init()
-            self.assertEqual(len(list(path.parent.glob("tickets.pre-lifecycle-v2-*.db"))), 1)
+            self.assertEqual(len(list(path.parent.glob("tickets.pre-lifecycle-v5-*.db"))), 1)

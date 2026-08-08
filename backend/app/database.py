@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 
 TICKETS_TABLE = """
 CREATE TABLE {name} (
@@ -37,7 +37,10 @@ CREATE TABLE IF NOT EXISTS comments (
     author_id TEXT NOT NULL,
     author_name TEXT NOT NULL,
     is_admin INTEGER NOT NULL DEFAULT 0 CHECK (is_admin IN (0, 1)),
+    author_role TEXT,
     message TEXT NOT NULL CHECK (length(message) BETWEEN 1 AND 2000),
+    metadata_json TEXT NOT NULL DEFAULT '{{}}',
+    delivery_status TEXT,
     created_at TEXT NOT NULL
 );
 
@@ -68,6 +71,43 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS idx_outbox_pending ON notification_outbox (status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS ticket_integrations (
+    ticket_id TEXT PRIMARY KEY REFERENCES tickets(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (provider = 'libredesk'),
+    conversation_id INTEGER,
+    conversation_uuid TEXT NOT NULL UNIQUE,
+    contact_email TEXT NOT NULL,
+    last_reconciled_at TEXT,
+    last_remote_status_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_ticket_integrations_reconcile
+ON ticket_integrations (last_reconciled_at, created_at);
+
+CREATE TABLE IF NOT EXISTS integration_inbox (
+    id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL UNIQUE,
+    event_type TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'processed', 'ignored', 'failed')),
+    last_error TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_integration_inbox_pending ON integration_inbox (status, next_attempt_at);
+
+CREATE TABLE IF NOT EXISTS sync_receipts (
+    provider TEXT NOT NULL,
+    remote_key TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (provider, remote_key)
+);
 
 CREATE TABLE IF NOT EXISTS rate_events (
     id TEXT PRIMARY KEY,
@@ -150,6 +190,8 @@ class Database:
         )
         if version >= SCHEMA_VERSION and not legacy_unique:
             self._ensure_lifecycle_indexes(conn)
+            self._ensure_comment_columns(conn)
+            self._ensure_integration_columns(conn)
             return
 
         ticket_count = conn.execute("SELECT COUNT(*) FROM tickets").fetchone()[0]
@@ -179,6 +221,8 @@ class Database:
                 conn.execute("DROP TABLE tickets")
                 conn.execute("ALTER TABLE tickets_lifecycle_new RENAME TO tickets")
                 self._ensure_lifecycle_indexes(conn)
+                self._ensure_comment_columns(conn)
+                self._ensure_integration_columns(conn)
                 self._verify_migration(conn, ticket_count, ticket_ids, related_counts)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             except Exception:
@@ -192,6 +236,8 @@ class Database:
             conn.execute("BEGIN IMMEDIATE")
             try:
                 self._ensure_lifecycle_indexes(conn)
+                self._ensure_comment_columns(conn)
+                self._ensure_integration_columns(conn)
                 self._verify_migration(conn, ticket_count, ticket_ids, related_counts)
                 conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
             except Exception:
@@ -204,6 +250,22 @@ class Database:
     def _ensure_lifecycle_indexes(conn: sqlite3.Connection) -> None:
         for statement in LIFECYCLE_INDEXES:
             conn.execute(statement)
+
+    @staticmethod
+    def _ensure_comment_columns(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info('comments')").fetchall()}
+        if "author_role" not in columns:
+            conn.execute("ALTER TABLE comments ADD COLUMN author_role TEXT")
+        if "metadata_json" not in columns:
+            conn.execute("ALTER TABLE comments ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'")
+        if "delivery_status" not in columns:
+            conn.execute("ALTER TABLE comments ADD COLUMN delivery_status TEXT")
+
+    @staticmethod
+    def _ensure_integration_columns(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info('ticket_integrations')").fetchall()}
+        if "last_remote_status_at" not in columns:
+            conn.execute("ALTER TABLE ticket_integrations ADD COLUMN last_remote_status_at TEXT")
 
     @staticmethod
     def _verify_migration(

@@ -62,13 +62,18 @@ class TicketRepository:
             raise HTTPException(status_code=404, detail="Ticket not found")
         if not user.is_admin and ticket["reporter_id"] != user.user_id:
             raise HTTPException(status_code=404, detail="Ticket not found")
-        comments = [
-            dict(row)
-            for row in conn.execute(
-                "SELECT * FROM comments WHERE ticket_id = ? ORDER BY created_at ASC",
-                (ticket_id,),
-            ).fetchall()
-        ]
+        comments = []
+        for row in conn.execute(
+            "SELECT * FROM comments WHERE ticket_id = ? ORDER BY created_at ASC",
+            (ticket_id,),
+        ).fetchall():
+            comment = dict(row)
+            try:
+                comment["metadata"] = json.loads(comment.pop("metadata_json") or "{}")
+            except json.JSONDecodeError:
+                comment["metadata"] = {}
+                comment.pop("metadata_json", None)
+            comments.append(comment)
         return {"ticket": ticket, "comments": comments}
 
     def current_user_ticket_for_item(self, conn, item_id: str, user: UserContext) -> dict[str, Any] | None:
@@ -111,8 +116,8 @@ class TicketRepository:
         issue_type: str,
         message: str,
         client_ip: str,
-        reply_to: str | None = None,
-        reply_to_required: bool = False,
+        contact_email: str | None = None,
+        contact_email_required: bool = False,
     ) -> dict[str, str]:
         existing = row_to_dict(
             conn.execute(
@@ -208,10 +213,10 @@ class TicketRepository:
         conn.execute(
             """
             INSERT INTO comments
-            (id, ticket_id, author_id, author_name, is_admin, message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (id, ticket_id, author_id, author_name, is_admin, author_role, message, created_at)
+            VALUES (?, ?, ?, ?, 0, 'reporter', ?, ?)
             """,
-            (comment_id, ticket_id, user.user_id, user.name, int(user.is_admin), message, now),
+            (comment_id, ticket_id, user.user_id, user.name, message, now),
         )
         conn.execute(
             """
@@ -228,10 +233,10 @@ class TicketRepository:
             "reporter_name": user.name,
             "reporter_id": user.user_id,
             "message": message,
-            "reply_to_required": reply_to_required,
+            "contact_email_required": contact_email_required,
         }
-        if reply_to:
-            notification_payload["reply_to"] = reply_to
+        if contact_email:
+            notification_payload["contact_email"] = contact_email
         payload = json.dumps(notification_payload, ensure_ascii=True)
         conn.execute(
             """
@@ -242,6 +247,14 @@ class TicketRepository:
             (outbox_id, f"ticket-created:{ticket_id}", ticket_id, payload, now, now, now),
         )
         return {"id": ticket_id, "status": "new"}
+
+    @staticmethod
+    def _enqueue_sync(conn, ticket_id: str, event_type: str, payload: dict, dedupe_key: str) -> None:
+        now = iso(utcnow())
+        conn.execute(
+            "INSERT OR IGNORE INTO notification_outbox (id, dedupe_key, ticket_id, event_type, payload, next_attempt_at, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)",
+            (str(uuid.uuid4()), dedupe_key, ticket_id, event_type, json.dumps(payload), now, now, now),
+        )
 
     def add_comment(self, conn, ticket_id: str, user: UserContext, message: str, client_ip: str) -> dict[str, str]:
         ticket = row_to_dict(conn.execute("SELECT * FROM tickets WHERE id = ?", (ticket_id,)).fetchone())
@@ -257,13 +270,21 @@ class TicketRepository:
         self._admit_rate(conn, "comment", user.user_id, client_ip)
         now = iso(utcnow())
         comment_id = str(uuid.uuid4())
+        author_role = "reporter" if ticket["reporter_id"] == user.user_id else "agent"
         conn.execute(
             """
             INSERT INTO comments
-            (id, ticket_id, author_id, author_name, is_admin, message, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            (id, ticket_id, author_id, author_name, is_admin, author_role, message, delivery_status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
             """,
-            (comment_id, ticket_id, user.user_id, user.name, int(user.is_admin), message, now),
+            (comment_id, ticket_id, user.user_id, user.name, int(author_role == "agent"), author_role, message, now),
+        )
+        self._enqueue_sync(
+            conn,
+            ticket_id,
+            "comment_created",
+            {"comment_id": comment_id, "message": message, "sender_type": "agent" if author_role == "agent" else "contact"},
+            f"comment-created:{comment_id}",
         )
         return {"id": comment_id, "status": "added"}
 
@@ -299,14 +320,16 @@ class TicketRepository:
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=409, detail="Another active ticket already exists for this media") from exc
+        event_id = str(uuid.uuid4())
         conn.execute(
             """
             INSERT INTO status_events
             (id, ticket_id, actor_id, actor_name, before_status, after_status, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (str(uuid.uuid4()), ticket_id, user.user_id, user.name, before, status, now),
+            (event_id, ticket_id, user.user_id, user.name, before, status, now),
         )
+        self._enqueue_sync(conn, ticket_id, "status_changed", {"status": status}, f"status-changed:{event_id}")
         return {"id": ticket_id, "status": status}
 
     def delete_tickets(self, conn, ticket_ids: list[str], user: UserContext) -> dict[str, list[str]]:
@@ -376,14 +399,16 @@ class TicketRepository:
                 )
             except sqlite3.IntegrityError as exc:
                 raise HTTPException(status_code=409, detail="Another active ticket already exists for this media") from exc
+            event_id = str(uuid.uuid4())
             conn.execute(
                 """
                 INSERT INTO status_events
                 (id, ticket_id, actor_id, actor_name, before_status, after_status, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (str(uuid.uuid4()), ticket_id, user.user_id, user.name, before, status, now),
+                (event_id, ticket_id, user.user_id, user.name, before, status, now),
             )
+            self._enqueue_sync(conn, ticket_id, "status_changed", {"status": status}, f"status-changed:{event_id}")
             changed_ids.append(ticket_id)
         return {"status": status, "updated_ids": changed_ids}
 

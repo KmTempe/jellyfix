@@ -15,6 +15,7 @@ from .notifications import outbox_worker
 from .repositories import TicketRepository
 from .routes import router
 from .wizarr import WizarrEmailLookup
+from .libredesk import LibredeskClient
 
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
@@ -27,11 +28,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     ticket_repo = TicketRepository(settings)
     jellyfin_client = JellyfinClient(settings)
     wizarr_email_lookup = WizarrEmailLookup(settings)
+    libredesk_client = LibredeskClient(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         app.state.outbox_task = asyncio.create_task(
-            outbox_worker(app.state.db, settings, app.state.wizarr_email_lookup)
+            outbox_worker(app.state.db, settings, app.state.wizarr_email_lookup, app.state.libredesk_client)
         )
         try:
             yield
@@ -56,13 +58,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.ticket_repo = ticket_repo
     app.state.jellyfin_client = jellyfin_client
     app.state.wizarr_email_lookup = wizarr_email_lookup
+    app.state.libredesk_client = libredesk_client
     app.state.outbox_task = None
 
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(settings.trusted_hosts))
 
     @app.middleware("http")
     async def request_security(request: Request, call_next: Callable):
-        if request.method not in SAFE_METHODS and request.headers.get("origin") != settings.public_origin:
+        is_libredesk_webhook = request.url.path.endswith("/api/v1/integrations/libredesk/webhook")
+        if request.method not in SAFE_METHODS and not is_libredesk_webhook and request.headers.get("origin") != settings.public_origin:
             return JSONResponse(status_code=403, content={"detail": "Origin not allowed"})
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > settings.max_body_bytes:

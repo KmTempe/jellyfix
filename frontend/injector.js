@@ -88,7 +88,13 @@
             .jellyfix-comments { display:flex; flex-direction:column; gap:12px; }
             .jellyfix-comment { max-width:82%; padding:10px 12px; border-radius:8px; background:#333; align-self:flex-start; white-space:pre-wrap; word-break:break-word; }
             .jellyfix-comment-admin { background:#006f98; align-self:flex-end; }
+            .jellyfix-comment-system { background:#4c4c4c; align-self:center; max-width:90%; }
             .jellyfix-comment-meta { display:block; margin-bottom:5px; color:rgba(255,255,255,.72); font-size:12px; }
+            .jellyfix-comment-delivery { display:block; margin-top:6px; color:#ffd166; font-size:12px; }
+            .jellyfix-comment-delivery-error { color:#ff8a80; }
+            .jellyfix-csat { border:1px solid #38bdf8; background:#075985; }
+            .jellyfix-csat-title { display:block; margin-bottom:6px; font-weight:600; }
+            .jellyfix-csat-action { display:inline-flex; margin-top:10px; color:#fff; background:#0284c7; border-radius:5px; padding:7px 10px; text-decoration:none; }
             #btn-jellyfix { margin-right:.5em; display:flex; align-items:center; justify-content:center; }
             #btn-admin-tickets { margin-top:5px; }
             .jf-badge-new { color:#ff5252 !important; }
@@ -386,11 +392,35 @@
     }
 
     function commentBubble(comment) {
-        const bubble = el("div", comment.is_admin ? "jellyfix-comment jellyfix-comment-admin" : "jellyfix-comment");
-        const meta = el("span", "jellyfix-comment-meta", `${comment.author_name} - ${new Date(comment.created_at).toLocaleString()}`);
+        const role = comment.author_role || (comment.is_admin ? "agent" : "reporter");
+        const bubbleClass = role === "agent"
+            ? "jellyfix-comment jellyfix-comment-admin"
+            : role === "system" ? "jellyfix-comment jellyfix-comment-system" : "jellyfix-comment";
+        const metadata = comment.metadata && typeof comment.metadata === "object" ? comment.metadata : {};
+        const isCsat = metadata.kind === "csat";
+        const bubble = el("div", `${bubbleClass}${isCsat ? " jellyfix-csat" : ""}`);
+        const roleLabel = role === "agent" ? "🎧 Support agent" : role === "system" ? "⚙ System" : "👤 Reporter";
+        const meta = el("span", "jellyfix-comment-meta", `${roleLabel}: ${comment.author_name} - ${new Date(comment.created_at).toLocaleString()}`);
         const msg = el("span", null, comment.message);
         bubble.dataset.commentId = comment.id;
-        bubble.append(meta, msg);
+        if (isCsat) {
+            const title = el("span", "jellyfix-csat-title", "<br>Rate this support");
+            bubble.append(meta, title, msg);
+            const action = Array.isArray(metadata.actions) ? metadata.actions[0] : null;
+            if (action && typeof action.url === "string" && /^https?:\/\//i.test(action.url)) {
+                const link = el("a", "jellyfix-csat-action", typeof action.label === "string" ? action.label : "Rate this support");
+                link.href = action.url;
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                bubble.appendChild(link);
+            }
+        } else {
+            bubble.append(meta, msg);
+        }
+        if (comment.delivery_status === "pending" || comment.delivery_status === "queued" || comment.delivery_status === "error") {
+            const statusText = comment.delivery_status === "error" ? "Delivery retry scheduled" : "Queued for delivery";
+            bubble.appendChild(el("span", `jellyfix-comment-delivery${comment.delivery_status === "error" ? " jellyfix-comment-delivery-error" : ""}`, statusText));
+        }
         return bubble;
     }
 

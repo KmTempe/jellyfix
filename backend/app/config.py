@@ -30,15 +30,6 @@ class Settings:
     comments_per_ip_hour: int
     comments_global_hour: int
     retention_days: int
-    smtp_server: str
-    smtp_port: int
-    smtp_user: str
-    smtp_password_file: str
-    smtp_password: str
-    email_from: str
-    email_to: str
-    smtp_timeout_seconds: float
-    smtp_messages_per_hour: int
     outbox_pending_cap: int
     allow_active_ticket_deletion: bool
     resolved_ticket_cooldown_seconds: int
@@ -46,7 +37,17 @@ class Settings:
     wizarr_token_file: str
     wizarr_timeout_seconds: float
     wizarr_cache_ttl_seconds: int
-    wizarr_reply_to_required: bool
+    wizarr_email_required: bool
+    libredesk_base_url: str
+    libredesk_credential_file: str
+    libredesk_webhook_secret_file: str
+    libredesk_inbox_id: int
+    libredesk_team_id: int
+    libredesk_tag: str
+    libredesk_subject_prefix: str
+    libredesk_public_url: str
+    libredesk_timeout_seconds: float
+    libredesk_reconcile_seconds: int
 
     @property
     def is_production(self) -> bool:
@@ -89,13 +90,6 @@ def load_settings() -> Settings:
     storage_path = os.getenv("STORAGE_PATH", "/data" if production else ".")
     database_path = os.getenv("DATABASE_PATH", str(Path(storage_path) / "tickets.db"))
 
-    smtp_password_file = os.getenv("SMTP_PASSWORD_FILE", "")
-    smtp_password = os.getenv("SMTP_PASSWORD", "")
-    smtp_server = os.getenv("SMTP_SERVER", "")
-    smtp_user = os.getenv("SMTP_USER", "")
-    if production and smtp_server and smtp_user and not smtp_password_file:
-        raise RuntimeError("SMTP_PASSWORD_FILE is required when SMTP is enabled in production")
-
     return Settings(
         environment=environment,
         root_path=root_path,
@@ -115,15 +109,6 @@ def load_settings() -> Settings:
         comments_per_ip_hour=int(os.getenv("COMMENTS_PER_IP_HOUR", "120")),
         comments_global_hour=int(os.getenv("COMMENTS_GLOBAL_HOUR", "500")),
         retention_days=int(os.getenv("RETENTION_DAYS", "90")),
-        smtp_server=smtp_server,
-        smtp_port=int(os.getenv("SMTP_PORT", "587")),
-        smtp_user=smtp_user,
-        smtp_password_file=smtp_password_file,
-        smtp_password=smtp_password,
-        email_from=os.getenv("EMAIL_FROM", smtp_user),
-        email_to=os.getenv("EMAIL_TO", smtp_user),
-        smtp_timeout_seconds=float(os.getenv("SMTP_TIMEOUT_SECONDS", "10")),
-        smtp_messages_per_hour=int(os.getenv("SMTP_MESSAGES_PER_HOUR", "20")),
         outbox_pending_cap=int(os.getenv("OUTBOX_PENDING_CAP", "500")),
         allow_active_ticket_deletion=_bool(
             "ALLOW_ACTIVE_TICKET_DELETION", os.getenv("ALLOW_ACTIVE_TICKET_DELETION", "false")
@@ -133,7 +118,17 @@ def load_settings() -> Settings:
         wizarr_token_file=os.getenv("WIZARR_TOKEN_FILE", ""),
         wizarr_timeout_seconds=float(os.getenv("WIZARR_TIMEOUT_SECONDS", "5")),
         wizarr_cache_ttl_seconds=int(os.getenv("WIZARR_CACHE_TTL_SECONDS", "300")),
-        wizarr_reply_to_required=_bool(
-            "WIZARR_REPLY_TO_REQUIRED", os.getenv("WIZARR_REPLY_TO_REQUIRED", "false")
+        wizarr_email_required=_bool(
+            "WIZARR_EMAIL_REQUIRED", os.getenv("WIZARR_EMAIL_REQUIRED", "false")
         ),
+        libredesk_base_url=os.getenv("LIBREDESK_BASE_URL", "").rstrip("/"),
+        libredesk_credential_file=os.getenv("LIBREDESK_CREDENTIAL_FILE", ""),
+        libredesk_webhook_secret_file=os.getenv("LIBREDESK_WEBHOOK_SECRET_FILE", ""),
+        libredesk_inbox_id=int(os.getenv("LIBREDESK_INBOX_ID", "0")),
+        libredesk_team_id=int(os.getenv("LIBREDESK_TEAM_ID", "0")),
+        libredesk_tag=os.getenv("LIBREDESK_TAG", "jellyfix").strip(),
+        libredesk_subject_prefix=os.getenv("LIBREDESK_SUBJECT_PREFIX", "jellyfin-issue#"),
+        libredesk_public_url=_origin(os.getenv("LIBREDESK_PUBLIC_URL", "")) if os.getenv("LIBREDESK_PUBLIC_URL", "").strip() else "",
+        libredesk_timeout_seconds=float(os.getenv("LIBREDESK_TIMEOUT_SECONDS", "5")),
+        libredesk_reconcile_seconds=int(os.getenv("LIBREDESK_RECONCILE_SECONDS", "300")),
     )

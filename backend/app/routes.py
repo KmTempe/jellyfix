@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from .auth import JellyfinClient, JellyfinUnauthorized, JellyfinUnavailable, UserContext, get_current_user, get_jellyfin_client
 from .database import Database
@@ -15,6 +15,7 @@ from .models import (
     TicketStatus,
 )
 from .repositories import TicketRepository
+from .notifications import enqueue_webhook, webhook_signature_valid
 from .wizarr import ReplyToUnavailable, WizarrEmailLookup
 
 
@@ -88,11 +89,11 @@ def create_ticket(
     except JellyfinUnavailable as exc:
         raise HTTPException(status_code=503, detail="Jellyfin media validation unavailable") from exc
 
-    reply_to = None
-    reply_to_required = request.app.state.settings.wizarr_reply_to_required
+    contact_email = None
+    contact_email_required = request.app.state.settings.wizarr_email_required
     if wizarr_email_lookup.enabled:
         try:
-            reply_to = wizarr_email_lookup.lookup(user.user_id, user.name)
+            contact_email = wizarr_email_lookup.lookup(user.user_id, user.name)
         except ReplyToUnavailable:
             # The durable outbox will retry this lookup before sending the notification.
             pass
@@ -105,9 +106,21 @@ def create_ticket(
             issue_type=payload.issue_type.value if hasattr(payload.issue_type, "value") else str(payload.issue_type),
             message=payload.message,
             client_ip=client_ip(request),
-            reply_to=reply_to,
-            reply_to_required=reply_to_required,
+            contact_email=contact_email,
+            contact_email_required=contact_email_required,
         )
+
+
+@router.post("/integrations/libredesk/webhook", status_code=202)
+async def libredesk_webhook(request: Request):
+    body = await request.body()
+    if not webhook_signature_valid(request.app.state.settings, body, request.headers.get("x-libredesk-signature")):
+        raise HTTPException(status_code=401, detail="Invalid LibreDesk webhook signature")
+    try:
+        enqueue_webhook(request.app.state.db, body)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(status_code=422, detail="Invalid LibreDesk webhook payload") from exc
+    return Response(status_code=202)
 
 
 @router.get("/tickets/mine")
