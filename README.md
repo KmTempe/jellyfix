@@ -137,7 +137,7 @@ Browser traffic stays on the Jellyfin HTTPS origin. JellyFix performs authentica
 ```mermaid
 flowchart TD
     Start(["Reporter submits a ticket"]) --> Auth["Validate Jellyfin identity"]
-    Auth --> Active{"Active ticket exists<br/>for this user and media?"}
+    Auth --> Active{"Active ticket exists<br/> for this user and media?"}
 
     Active -->|"Yes"| Conflict(["409 Conflict<br/>return existing ticket"])
     Active -->|"No"| Cooldown{"Resolved less than<br/>5 minutes ago?"}
