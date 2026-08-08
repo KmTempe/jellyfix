@@ -75,12 +75,26 @@ class LibredeskClient:
             f"<p>{html.escape(str(values['message'])).replace(chr(10), '<br>')}</p>"
         )
 
+    def conversation_subject(self, payload: dict) -> str:
+        return f"{self.settings.libredesk_subject_prefix}{payload['ticket_id']}"
+
+    def search_conversations(self, subject: str) -> list[dict]:
+        data = self._request("GET", "/api/v1/conversations/search", query={"query": subject})
+        results = data if isinstance(data, list) else data.get("results", []) if isinstance(data, dict) else []
+        return [
+            conversation
+            for conversation in results
+            if isinstance(conversation, dict)
+            and str(conversation.get("subject") or "").startswith(subject)
+            and conversation.get("uuid")
+        ]
+
     def create_conversation(self, payload: dict, contact_email: str) -> dict:
         data = self._request(
             "POST",
             "/api/v1/conversations",
             payload={
-                "subject": f"{self.settings.libredesk_subject_prefix}{payload['ticket_id']}",
+                "subject": self.conversation_subject(payload),
                 "content": self.initial_content(payload),
                 "inbox_id": self.settings.libredesk_inbox_id,
                 "team_id": self.settings.libredesk_team_id or None,

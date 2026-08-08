@@ -4,3 +4,12 @@ __pycache__/
 .env
 jellyfin_credentials
 reports/
+.vscode/
+secrets/
+backend/data/
+backend/.test-tmp/
+backend/*.egg-info/
+.venv/
+.coverage
+htmlcov/
+.pytest_cache/

@@ -20,6 +20,7 @@ from .wizarr import ReplyToUnavailable, WizarrEmailLookup
 
 
 RETRY_DELAYS = [timedelta(minutes=1), timedelta(minutes=5), timedelta(minutes=30)]
+MAX_RECONCILE_MESSAGE_PAGES = 100
 
 
 def _redact_error(exc: Exception) -> str:
@@ -131,13 +132,19 @@ def _process_outbox_row(db: Database, settings: Settings, wizarr: WizarrEmailLoo
             with db.transaction() as conn:
                 mapping = _mapping(conn, row["ticket_id"])
             if not mapping:
-                remote = libredesk.create_conversation(payload, contact_email)
+                subject = libredesk.conversation_subject(payload)
+                matches = libredesk.search_conversations(subject)
+                if len(matches) > 1:
+                    raise LibredeskUnavailable("Multiple LibreDesk conversations matched the ticket subject")
+                remote = matches[0] if matches else libredesk.create_conversation(payload, contact_email)
                 with db.transaction() as conn:
                     conn.execute(
                         "INSERT OR IGNORE INTO ticket_integrations (ticket_id, provider, conversation_id, conversation_uuid, contact_email, created_at, updated_at) VALUES (?, 'libredesk', ?, ?, ?, ?, ?)",
                         (row["ticket_id"], remote.get("id"), remote["uuid"], contact_email, iso(utcnow()), iso(utcnow())),
                     )
                     mapping = _mapping(conn, row["ticket_id"])
+            if not mapping:
+                raise LibredeskUnavailable("LibreDesk conversation mapping could not be stored")
             libredesk.assign_team(mapping["conversation_uuid"])
             libredesk.add_tag(mapping["conversation_uuid"])
         elif row["event_type"] == "comment_created":
@@ -362,9 +369,13 @@ def reconcile_once(db: Database, settings: Settings, libredesk: LibredeskClient)
                         str(conversation.get("status") or ""),
                         _remote_status_timestamp({}, conversation),
                     )
-            for message in libredesk.messages(mapping["conversation_uuid"]):
-                event = {"event": "message.created", "payload": message}
-                enqueue_webhook(db, json.dumps(event, sort_keys=True).encode())
+            for page in range(1, MAX_RECONCILE_MESSAGE_PAGES + 1):
+                messages = libredesk.messages(mapping["conversation_uuid"], page=page)
+                for message in messages:
+                    event = {"event": "message.created", "payload": message}
+                    enqueue_webhook(db, json.dumps(event, sort_keys=True).encode())
+                if len(messages) < 100:
+                    break
             with db.transaction() as conn:
                 conn.execute("UPDATE ticket_integrations SET last_reconciled_at = ?, updated_at = ? WHERE ticket_id = ?", (iso(utcnow()), iso(utcnow()), mapping["ticket_id"]))
         except Exception:

@@ -1,204 +1,282 @@
 # JellyFix
 
-JellyFix is a secure Jellyfin Web issue reporter. It adds one English browser injector to Jellyfin Web and stores tickets in a FastAPI/SQLite backend.
+JellyFix adds issue reporting and ticket history to Jellyfin Web. A small browser injector talks to a FastAPI backend that validates Jellyfin users, stores tickets in SQLite, and synchronizes support conversations with LibreDesk.
 
-The current remake replaces the old unauthenticated API and dashboard with a token-validated API under `/jellyfix/api/v1`.
+## Features
 
-## Architecture diagram
+- Server-verified Jellyfin identity and administrator permissions
+- One active ticket per user and media item, with unlimited resolved history
+- Five-minute cooldown after resolution with `429` and `Retry-After`
+- User ticket history and administrator Ticket Manager
+- Durable SQLite queues for Wizarr and LibreDesk outages
+- Bidirectional LibreDesk messages and status synchronization
+- Safe CSAT links and SQLite migration backups
+
+### Request and data path
+
 ```mermaid
 flowchart LR
-    Browser["Jellyfin Web + injector.js"]
-    Proxy["Nginx Proxy Manager"]
-    API["JellyFix API"]
-    Jellyfin["Jellyfin API"]
-    DB["SQLite + audit/outbox"]
-    SMTP["SMTP server"]
+    Browser["&lt;&lt;client&gt;&gt;<br/>Jellyfin Web<br/><b>injector.js</b>"]
+    Jellyfin["&lt;&lt;external API&gt;&gt;<br/>Jellyfin<br/><b>GET /Users/Me</b>"]
 
-    Browser -->|"Bearer Jellyfin token"| Proxy
-    Proxy --> API
-    API -->|"Validate token: /Users/Me"| Jellyfin
-    API -->|"Validate media: /Items/{id}"| Jellyfin
-    API --> DB
-    DB -->|"Bounded outbox worker"| SMTP
+    subgraph JellyFixContainer["&lt;&lt;container&gt;&gt; JellyFix :8000 — jellyfix_default"]
+        direction TB
+        API["&lt;&lt;component&gt;&gt;<br/>Ticket API<br/><b>/api/v1/tickets</b>"]
+        SQLite[("&lt;&lt;database&gt;&gt;<br/>SQLite<br/>tickets · comments · mappings<br/>outbox · webhook inbox")]
+        API -->|"persist + enqueue"| SQLite
+    end
+
+    Browser <-->|"create · reply · history<br/>tickets · status · CSAT"| API
+    API -->|"validate bearer token"| Jellyfin
+
+    classDef client fill:#e8f1ff,stroke:#2563eb,stroke-width:2px,color:#111827;
+    classDef service fill:#eefbf3,stroke:#16803c,stroke-width:2px,color:#111827;
+    classDef external fill:#fff7e6,stroke:#b7791f,stroke-width:2px,color:#111827;
+    classDef database fill:#f4ecff,stroke:#7c3aed,stroke-width:2px,color:#111827;
+    class Browser client;
+    class API service;
+    class Jellyfin external;
+    class SQLite database;
 ```
 
-## Current Behavior
+### LibreDesk synchronization bridge
 
-- Users report media issues from Jellyfin Web through `frontend/injector.js`.
-- Every API route except health requires `Authorization: Bearer <Jellyfin access token>`.
-- The backend validates that token against Jellyfin `/Users/Me` on every request.
-- User ID, display name and administrator status come from Jellyfin, not from the browser.
-- Ticket creation validates media access through Jellyfin and derives the media name server-side.
-- Only the ticket reporter and verified Jellyfin administrators can read or comment on a ticket.
-- Administrators manage tickets inside the injector modal, not a separate `/admin` page.
-- The UI uses DOM APIs and blocks HTML parsing/code execution sinks in tests.
-- SQLite data is stored in `/data/tickets.db` inside the container.
+```mermaid
+flowchart LR
+    Wizarr["&lt;&lt;external API&gt;&gt;<br/>Wizarr<br/><b>GET /api/users?username=</b>"]
 
-Removed legacy routes:
+    subgraph JellyFixContainer["&lt;&lt;container&gt;&gt; JellyFix :8000"]
+        direction TB
+        Outbox[("SQLite outbox")]
+        Worker["&lt;&lt;component&gt;&gt;<br/>Sync worker<br/>retry + reconciliation"]
+        Webhook["&lt;&lt;component&gt;&gt;<br/>Signed webhook<br/><b>/api/v1/integrations/libredesk/webhook</b>"]
+        Inbox[("SQLite webhook inbox")]
 
-```text
-/admin
-/all_tickets
-/status/*
-/comments
-PUT /tickets/{id}/status
+        Outbox -->|"pending work"| Worker
+        Webhook -->|"durable 202"| Inbox
+    end
+
+    subgraph LibreDeskContainer["&lt;&lt;container&gt;&gt; LibreDesk :9000"]
+        LibreDesk["&lt;&lt;component&gt;&gt;<br/>Support inbox<br/><b>libredesk_app:9000</b>"]
+    end
+
+    Worker -->|"exact reporter lookup"| Wizarr
+    Worker ==>|"conversation · message · status APIs"| LibreDesk
+    LibreDesk ==>|"message/status webhook<br/>http://jellyfix:8000"| Webhook
+
+    Reporter["&lt;&lt;user&gt;&gt;<br/>Reporter email"]
+    LibreDesk -.->|"agent replies + notifications"| Reporter
+
+    classDef client fill:#e8f1ff,stroke:#2563eb,stroke-width:2px,color:#111827;
+    classDef service fill:#eefbf3,stroke:#16803c,stroke-width:2px,color:#111827;
+    classDef external fill:#fff7e6,stroke:#b7791f,stroke-width:2px,color:#111827;
+    classDef database fill:#f4ecff,stroke:#7c3aed,stroke-width:2px,color:#111827;
+    class Reporter client;
+    class Worker,Webhook,LibreDesk service;
+    class Wizarr external;
+    class Outbox,Inbox database;
 ```
 
-Active routes:
+JellyFix is attached to both `jellyfix_default` and `libredesk_libredesk`. The thick arrows are private container-to-container traffic over `libredesk_libredesk`; no public LibreDesk route is required.
 
-```text
-GET   /jellyfix/api/v1/healthz
-GET   /jellyfix/api/v1/me
-GET   /jellyfix/api/v1/items/{item_id}/ticket
-POST  /jellyfix/api/v1/tickets
-GET   /jellyfix/api/v1/tickets/{ticket_id}
-POST  /jellyfix/api/v1/tickets/{ticket_id}/comments
-PATCH /jellyfix/api/v1/tickets/{ticket_id}/status
-PATCH /jellyfix/api/v1/tickets/status                         # JSON body: {"ticket_ids":[...],"status":"resolved"}
-DELETE /jellyfix/api/v1/tickets/{ticket_id}
-DELETE /jellyfix/api/v1/tickets                         # JSON body: {"ticket_ids":[...]}, max 100
-GET   /jellyfix/api/v1/admin/tickets
+### Network topology
+
+```mermaid
+flowchart TB
+    Browser["&lt;&lt;client&gt;&gt;<br/>Jellyfin Web UI<br/><b>injector.js</b>"]
+    Gateway["&lt;&lt;public endpoint&gt;&gt;<br/>Jellyfin host / reverse proxy<br/><b>HTTPS :443</b>"]
+
+    Browser <-->|"browser HTTPS"| Gateway
+
+    subgraph PublicRoutes["Same-origin routes"]
+        JellyfinWeb["&lt;&lt;route&gt;&gt;<br/><b>/web</b><br/>Jellyfin UI"]
+        JellyFixRoute["&lt;&lt;route&gt;&gt;<br/><b>/jellyfix/api/v1</b><br/>ticket API"]
+    end
+
+    Gateway --> JellyfinWeb
+    Gateway --> JellyFixRoute
+
+    subgraph JellyFixNetwork["Docker network: jellyfix_default"]
+        JellyFix["&lt;&lt;container&gt;&gt;<br/>JellyFix<br/><b>jellyfix:8000</b>"]
+        Database[("&lt;&lt;volume&gt;&gt;<br/>SQLite data<br/><b>/data</b>")]
+        JellyFix --> Database
+    end
+
+    JellyFixRoute -->|"proxied API request"| JellyFix
+
+    JellyfinAPI["&lt;&lt;server API&gt;&gt;<br/>Jellyfin<br/><b>/Users/Me</b>"]
+    WizarrAPI["&lt;&lt;server API&gt;&gt;<br/>Wizarr<br/><b>/api/users?username=</b>"]
+
+    JellyFix -->|"token validation"| JellyfinAPI
+    JellyFix -->|"reporter email lookup"| WizarrAPI
+
+    subgraph LibreDeskNetwork["Docker network: libredesk_libredesk"]
+        LibreDesk["&lt;&lt;container&gt;&gt;<br/>LibreDesk<br/><b>libredesk_app:9000</b>"]
+    end
+
+    JellyFix <-->|"private container bridge<br/>REST sync → · signed webhook ←"| LibreDesk
+    LibreDesk -.->|"configured inbox delivery"| Email["&lt;&lt;external service&gt;&gt;<br/>Email provider"]
+    Email -.-> Reporter["&lt;&lt;user&gt;&gt;<br/>Reporter"]
+
+    classDef client fill:#e8f1ff,stroke:#2563eb,stroke-width:2px,color:#111827;
+    classDef service fill:#eefbf3,stroke:#16803c,stroke-width:2px,color:#111827;
+    classDef external fill:#fff7e6,stroke:#b7791f,stroke-width:2px,color:#111827;
+    classDef database fill:#f4ecff,stroke:#7c3aed,stroke-width:2px,color:#111827;
+    class Browser,Reporter client;
+    class Gateway,JellyfinWeb,JellyFixRoute,JellyFix,LibreDesk service;
+    class JellyfinAPI,WizarrAPI,Email external;
+    class Database database;
 ```
 
-## Docker Deployment
+Browser traffic stays on the Jellyfin HTTPS origin. JellyFix performs authentication, Wizarr lookup, and LibreDesk synchronization as server-to-server requests; only the LibreDesk bridge uses the shared private Docker network.
 
-The Compose service publishes JellyFix directly on host port `18000`:
+## Ticket lifecycle
 
-```yaml
-ports:
-  - "18000:8000"
+### Creation and delivery
+
+```mermaid
+flowchart TD
+    Start(["Reporter submits a ticket"]) --> Auth["Validate Jellyfin identity"]
+    Auth --> Active{"Active ticket exists<br/>for this user and media?"}
+
+    Active -->|"Yes"| Conflict(["409 Conflict<br/>return existing ticket"])
+    Active -->|"No"| Cooldown{"Resolved less than<br/>5 minutes ago?"}
+    Cooldown -->|"Yes"| RateLimit(["429 Too Many Requests<br/>return Retry-After"])
+    Cooldown -->|"No"| Create["Persist ticket with NEW status"]
+
+    Create --> Queue["Add conversation creation<br/>to durable outbox"]
+    Queue --> Accepted(["Ticket returned to reporter"])
+    Queue -.-> Worker["Background sync attempt"]
+    Worker --> Email{"Exact Wizarr email found?"}
+    Email -->|"No or unavailable"| Pending(["Keep pending<br/>retry with backoff"])
+    Email -->|"Yes"| Search["Search LibreDesk by<br/>jellyfin-issue#ticket_uuid"]
+    Search --> Matches{"Matching conversations"}
+    Matches -->|"None"| Remote["Create conversation"]
+    Matches -->|"Exactly one"| Reuse["Reuse conversation"]
+    Matches -->|"More than one"| Ambiguous(["Keep pending<br/>manual review required"])
+    Remote --> Synced(["Conversation mapped"])
+    Reuse --> Synced
+
+    classDef decision fill:#fff7e6,stroke:#b7791f,stroke-width:2px,color:#111827;
+    classDef blocked fill:#fff0f0,stroke:#c53030,stroke-width:2px,color:#111827;
+    classDef terminal fill:#f4ecff,stroke:#7c3aed,stroke-width:2px,color:#111827;
+    class Active,Cooldown,Email,Matches decision;
+    class Conflict,RateLimit,Pending,Ambiguous blocked;
+    class Start,Accepted,Synced terminal;
 ```
 
+Each pending delivery is retried in a later worker cycle. A failed external integration never removes the local ticket.
 
-Runtime hardening in `docker-compose.yml`:
+### Status and conversation flow
 
-- non-root container user `10001:10001`
-- read-only root filesystem
-- writable `/data`
-- temporary `/tmp`
-- dropped Linux capabilities
-- `no-new-privileges:true`
+```mermaid
+flowchart LR
+    New["NEW"] -->|"agent reply<br/>or remote open"| Progress["IN PROGRESS"]
+    New -->|"resolved directly"| Resolved["RESOLVED"]
+    Progress -->|"resolve or close"| Resolved
+    Resolved --> Outcome{"Next action"}
 
-Start or recreate:
+    New -.-> Messages["Messages sync<br/>in both directions"]
+    Progress -.-> Messages
+
+    Outcome -->|"CSAT received"| CSAT["Show safe CSAT action"]
+    Outcome -->|"reopened without<br/>an active conflict"| Reopened["IN PROGRESS<br/>(reopened)"]
+    Outcome -->|"5-minute cooldown elapsed"| Next(["Another ticket may be created"])
+    Outcome -->|"administrator deletes locally"| Deleted(["Local ticket deleted"])
+    Reopened -->|"resolve again"| ResolvedAgain["RESOLVED"]
+    Deleted -.-> Preserved["LibreDesk conversation remains"]
+
+    classDef state fill:#eefbf3,stroke:#16803c,stroke-width:2px,color:#111827;
+    classDef action fill:#e8f1ff,stroke:#2563eb,stroke-width:2px,color:#111827;
+    classDef decision fill:#fff7e6,stroke:#b7791f,stroke-width:2px,color:#111827;
+    classDef terminal fill:#f4ecff,stroke:#7c3aed,stroke-width:2px,color:#111827;
+    class New,Progress,Resolved,Reopened,ResolvedAgain state;
+    class Messages,CSAT action;
+    class Outcome decision;
+    class Next,Deleted terminal;
+```
+
+## Quick start
+
+1. Copy `.env.example` to `.env` and set your deployment values.
+2. Create the credential files described in the integration guides.
+3. Ensure the external LibreDesk Docker network exists when LibreDesk is enabled.
+4. Build and start JellyFix:
 
 ```powershell
 docker compose up --build -d
-```
-
-Check status:
-
-```powershell
 docker compose ps
-docker compose logs -f jellyfix
 ```
 
-Health check from the host:
+The Compose service exposes JellyFix on host port `18000`. Runtime data is stored in `backend/data` and mounted at `/data`.
 
-```powershell
-Invoke-WebRequest -UseBasicParsing -Headers @{Host='your-jellyfin.example'} http://127.0.0.1:18000/api/v1/healthz
-```
+Integration setup:
 
-The `Host` header must match `TRUSTED_HOSTS`.
+- [LibreDesk setup](docs/libredesk_setup.md)
+- [Wizarr setup](docs/wizarr_setup.md)
 
-## Required Configuration
+## Injector
 
-Copy `.env.example` to `.env` and set values for your deployment:
-
-```dotenv
-JELLYFIX_ENV=production
-ROOT_PATH=/jellyfix
-JELLYFIN_URL=http://host.docker.internal:8096
-PUBLIC_ORIGIN=https://your-jellyfin.example
-TRUSTED_HOSTS=your-jellyfin.example
-STORAGE_PATH=/data
-DATABASE_PATH=/data/tickets.db
-ALLOW_ACTIVE_TICKET_DELETION=false
-
-SMTP_SERVER=
-SMTP_PORT=587
-SMTP_USER=
-SMTP_PASSWORD_FILE=/run/secrets/smtp_password
-EMAIL_FROM=
-EMAIL_TO=
-```
-
-Important:
-
-- `JELLYFIN_URL` is the URL JellyFix uses from inside the container to reach Jellyfin.
-- `PUBLIC_ORIGIN` must exactly match the browser origin that loads Jellyfin Web, including scheme and port when non-default.
-- `TRUSTED_HOSTS` must include the HTTP host JellyFix receives.
-- If Jellyfin runs on the Windows host, `http://host.docker.internal:8096` works from Docker Desktop.
-- Do not keep SMTP passwords inline in `.env`; put the password in `secrets/smtp_password`.
-- Ticket deletion is administrator-only. By default, only resolved tickets can be deleted; set `ALLOW_ACTIVE_TICKET_DELETION=true` only when administrators must also delete new or in-progress tickets.
-
-SMTP is optional. When configured, JellyFix sends plain-text new-ticket notifications through a bounded outbox.
-
-## Injector Deployment
-
-Use only:
-
-```text
-frontend/injector.js
-```
-
-For convenience use javascript injector plugin from https://github.com/n00bcodr/Jellyfin-JavaScript-Injector
-
-The injector expects the API at:
+Install `frontend/injector.js` in Jellyfin Web using a JavaScript injector plugin. JellyFix must be reachable from the Jellyfin browser origin under `/jellyfix` because the injector uses:
 
 ```javascript
 window.location.origin + "/jellyfix/api/v1"
 ```
 
-That means JellyFix should be reachable from the same browser origin as Jellyfin Web under `/jellyfix`. If you expose only `:18000` directly, either your public routing must still serve it under the same Jellyfin origin, or the injector API base must be changed intentionally.
+After replacing the script, clear the Jellyfin Web cache or hard-refresh the browser.
 
-After replacing the injector in Jellyfin Web, clear browser cache or hard-refresh so old injected code is not reused.
+## API
 
+All routes except health and the signed LibreDesk webhook require a Jellyfin bearer token.
 
+```text
+GET    /api/v1/healthz
+GET    /api/v1/me
+GET    /api/v1/items/{item_id}/ticket
+POST   /api/v1/tickets
+GET    /api/v1/tickets/mine
+GET    /api/v1/tickets/{ticket_id}
+POST   /api/v1/tickets/{ticket_id}/comments
+PATCH  /api/v1/tickets/{ticket_id}/status
+PATCH  /api/v1/tickets/status
+DELETE /api/v1/tickets/{ticket_id}
+DELETE /api/v1/tickets
+GET    /api/v1/admin/tickets
+POST   /api/v1/integrations/libredesk/webhook
+```
 
 ## Development
 
-Install dependencies:
+Use the repository virtual environment:
 
 ```powershell
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r backend\requirements.txt
+python -m unittest discover -s backend -p "test_*.py" -v
 ```
 
-Run the API locally:
+Run locally:
 
 ```powershell
 Set-Location backend
-$env:JELLYFIX_ENV='test'
+$env:JELLYFIX_ENV='development'
 $env:JELLYFIN_URL='http://localhost:8096'
 $env:PUBLIC_ORIGIN='http://localhost:8000'
 $env:TRUSTED_HOSTS='localhost:8000'
 python -m uvicorn main:app --reload --port 8000
 ```
 
-Run tests:
+Release checks:
 
 ```powershell
-Set-Location backend
-$env:PYTHONDONTWRITEBYTECODE='1'
-python -m unittest -v test_security.py
-```
-
-Useful validation commands:
-
-```powershell
+python -m coverage run -m unittest discover -s backend -p "test_*.py"
+python -m coverage report --show-missing
+python -m compileall -q backend\app backend\main.py
 node --check frontend\injector.js
-rg "innerHTML|outerHTML|insertAdjacentHTML|document\.write|eval\(" frontend\injector.js
-docker compose config
+docker compose config --quiet
+git diff --check
 ```
 
-The `rg` command should return no matches.
+## Security and data
 
-## Security Notes
-
-- no client-supplied identity or admin flag
-- no unauthenticated ticket mutation
-- no separate backend-rendered admin dashboard
-- no wildcard CORS
-- strict body size and Pydantic validation
-- bounded ticket/comment quotas
-- plain-text email outbox with capped retries
-- no HTML string rendering in the injector
+Do not commit `.env`, `secrets/`, SQLite databases, migration backups, or credential exports. JellyFix derives user identity and administrator status from Jellyfin and renders browser content with DOM text APIs.

@@ -13,6 +13,7 @@ from pathlib import Path
 from dataclasses import replace
 from unittest.mock import patch
 
+import httpx
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -20,7 +21,7 @@ from app.auth import MediaContext, UserContext, get_current_user
 from app.config import load_settings
 from app.database import Database
 from app.factory import create_app
-from app.libredesk import LibredeskClient
+from app.libredesk import LibredeskClient, LibredeskPermanentError, LibredeskUnavailable
 from app.notifications import enqueue_webhook, process_inbox_once, process_outbox_once, reconcile_once, webhook_signature_valid
 from app.repositories import TicketRepository, iso
 from app.wizarr import ReplyToUnavailable, WizarrEmailLookup
@@ -54,15 +55,43 @@ class RecordingLibreDesk:
 class ReconcileLibreDesk:
     enabled = True
 
-    def __init__(self, status: str, updated_at: str):
+    def __init__(self, status: str, updated_at: str, pages: dict[int, list[dict]] | None = None):
         self.status = status
         self.updated_at = updated_at
+        self.pages = pages or {}
+        self.requested_pages: list[int] = []
 
     def conversation(self, _conversation_uuid: str) -> dict:
         return {"status": self.status, "updated_at": self.updated_at}
 
-    def messages(self, _conversation_uuid: str) -> list[dict]:
-        return []
+    def messages(self, _conversation_uuid: str, page: int = 1) -> list[dict]:
+        self.requested_pages.append(page)
+        return self.pages.get(page, [])
+
+
+class RecoveryLibreDesk:
+    def __init__(self, matches: list[dict]):
+        self.matches = matches
+        self.create_calls = 0
+        self.assigned: list[str] = []
+        self.tagged: list[str] = []
+
+    @staticmethod
+    def conversation_subject(payload: dict) -> str:
+        return f"jellyfin-issue#{payload['ticket_id']}"
+
+    def search_conversations(self, _subject: str) -> list[dict]:
+        return self.matches
+
+    def create_conversation(self, payload: dict, _contact_email: str) -> dict:
+        self.create_calls += 1
+        return {"id": 10, "uuid": f"created-{payload['ticket_id']}"}
+
+    def assign_team(self, conversation_uuid: str) -> None:
+        self.assigned.append(conversation_uuid)
+
+    def add_tag(self, conversation_uuid: str) -> None:
+        self.tagged.append(conversation_uuid)
 
 
 class TicketLifecycleTests(unittest.TestCase):
@@ -289,7 +318,7 @@ class TicketLifecycleTests(unittest.TestCase):
             "payload": {
                 "uuid": "agent-message", "conversation_uuid": "conversation-1", "sender_id": 34,
                 "sender_type": "agent", "type": "outgoing", "private": False, "text_content": "Hello",
-                "author": {"id": 34, "type": "agent", "first_name": "Kosmas", "last_name": "Temperekidis"},
+                "author": {"id": 34, "type": "agent", "first_name": "Support", "last_name": "Agent"},
             },
         }
         csat_event = {
@@ -299,7 +328,7 @@ class TicketLifecycleTests(unittest.TestCase):
                 "sender_type": "agent", "type": "outgoing", "private": False, "text_content": "Please rate this conversation",
                 "content": '<p>Please rate this conversation <a href="https://desk.example.test/csat/token">Rate</a></p>',
                 "meta": {"is_csat": True, "csat_uuid": "csat-1"},
-                "author": {"type": "agent", "first_name": "Kosmas", "last_name": "Temperekidis"},
+                "author": {"type": "agent", "first_name": "Support", "last_name": "Agent"},
             },
         }
         private_event = {
@@ -312,7 +341,7 @@ class TicketLifecycleTests(unittest.TestCase):
         with self.db.connect() as conn:
             comments = conn.execute("SELECT author_name, author_role, is_admin, message, metadata_json FROM comments WHERE ticket_id = ? ORDER BY created_at", (ticket_id,)).fetchall()
         self.assertEqual(len(comments), 2)
-        self.assertEqual(dict(comments[0])["author_name"], "Kosmas Temperekidis")
+        self.assertEqual(dict(comments[0])["author_name"], "Support Agent")
         self.assertEqual(dict(comments[0])["author_role"], "agent")
         metadata = json.loads(comments[1]["metadata_json"])
         self.assertEqual(metadata["kind"], "csat")
@@ -326,6 +355,109 @@ class TicketLifecycleTests(unittest.TestCase):
             request.call_args.kwargs["payload"],
             {"message": "&lt;reply&gt;", "sender_type": "contact", "private": False, "echo_id": "local-comment"},
         )
+
+    def test_libredesk_conversation_search_filters_to_matching_subjects(self):
+        client = LibredeskClient(self.settings)
+        with patch.object(
+            client,
+            "_request",
+            return_value={
+                "results": [
+                    {"uuid": "match", "subject": "jellyfin-issue#ticket [#10]"},
+                    {"uuid": "other", "subject": "another-ticket"},
+                    {"subject": "jellyfin-issue#ticket"},
+                ]
+            },
+        ) as request:
+            matches = client.search_conversations("jellyfin-issue#ticket")
+        self.assertEqual(matches, [{"uuid": "match", "subject": "jellyfin-issue#ticket [#10]"}])
+        self.assertEqual(request.call_args.kwargs["query"], {"query": "jellyfin-issue#ticket"})
+
+    def test_libredesk_creation_retry_recovers_existing_conversation_without_duplicate(self):
+        ticket_id = self.add_ticket(status="new")
+        now = iso(NOW)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO notification_outbox (id, dedupe_key, ticket_id, event_type, payload, attempt_count, next_attempt_at, status, created_at, updated_at) VALUES (?, ?, ?, 'ticket_created', ?, 1, ?, 'pending', ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    f"ticket-created:{ticket_id}",
+                    ticket_id,
+                    json.dumps({"ticket_id": ticket_id, "reporter_name": "Member", "contact_email": "member@example.com"}),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        libredesk = RecoveryLibreDesk([{"id": 9, "uuid": "existing-conversation", "subject": f"jellyfin-issue#{ticket_id}"}])
+        self.assertEqual(process_outbox_once(self.db, self.settings, UnavailableWizarr(), libredesk), 1)
+        self.assertEqual(libredesk.create_calls, 0)
+        with self.db.connect() as conn:
+            mapping = conn.execute("SELECT conversation_uuid FROM ticket_integrations WHERE ticket_id = ?", (ticket_id,)).fetchone()
+            outbox = conn.execute("SELECT status FROM notification_outbox WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        self.assertEqual(mapping["conversation_uuid"], "existing-conversation")
+        self.assertEqual(outbox["status"], "sent")
+
+    def test_libredesk_creation_with_ambiguous_matches_stays_pending(self):
+        ticket_id = self.add_ticket(status="new")
+        now = iso(NOW)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO notification_outbox (id, dedupe_key, ticket_id, event_type, payload, next_attempt_at, status, created_at, updated_at) VALUES (?, ?, ?, 'ticket_created', ?, ?, 'pending', ?, ?)",
+                (
+                    str(uuid.uuid4()),
+                    f"ticket-created:{ticket_id}",
+                    ticket_id,
+                    json.dumps({"ticket_id": ticket_id, "contact_email": "member@example.com"}),
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        libredesk = RecoveryLibreDesk([
+            {"uuid": "first", "subject": f"jellyfin-issue#{ticket_id}"},
+            {"uuid": "second", "subject": f"jellyfin-issue#{ticket_id} [#2]"},
+        ])
+        with patch("app.notifications.utcnow", return_value=NOW):
+            self.assertEqual(process_outbox_once(self.db, self.settings, UnavailableWizarr(), libredesk), 0)
+        self.assertEqual(libredesk.create_calls, 0)
+        with self.db.connect() as conn:
+            outbox = conn.execute("SELECT status, attempt_count, last_error FROM notification_outbox WHERE ticket_id = ?", (ticket_id,)).fetchone()
+        self.assertEqual(outbox["status"], "pending")
+        self.assertEqual(outbox["attempt_count"], 1)
+        self.assertNotIn("conversation", outbox["last_error"].lower())
+
+    def test_libredesk_http_errors_are_classified_without_response_body(self):
+        credential_path = Path(self.temp_dir.name) / "libredesk-credential"
+        credential_path.write_text("key:secret", encoding="utf-8")
+        settings = replace(
+            self.settings,
+            libredesk_base_url="http://libredesk.test",
+            libredesk_credential_file=str(credential_path),
+            libredesk_inbox_id=1,
+        )
+        client = LibredeskClient(settings)
+        request = httpx.Request("GET", "http://libredesk.test/api/v1/conversations/search")
+        for status in (401, 403, 429, 500):
+            response = httpx.Response(status, request=request, text="sensitive response body")
+            with patch("app.libredesk.httpx.request", return_value=response):
+                with self.assertRaises(LibredeskUnavailable) as error:
+                    client.search_conversations("jellyfin-issue#ticket")
+            self.assertNotIn("sensitive", str(error.exception))
+        response = httpx.Response(400, request=request, text="sensitive response body")
+        with patch("app.libredesk.httpx.request", return_value=response):
+            with self.assertRaises(LibredeskPermanentError) as error:
+                client.search_conversations("jellyfin-issue#ticket")
+        self.assertNotIn("sensitive", str(error.exception))
+
+    def test_libredesk_credentials_require_key_and_secret(self):
+        credential_path = Path(self.temp_dir.name) / "libredesk-credential"
+        settings = replace(self.settings, libredesk_credential_file=str(credential_path))
+        client = LibredeskClient(settings)
+        for invalid in ("", "key-only", ":secret", "key:"):
+            credential_path.write_text(invalid, encoding="utf-8")
+            with self.assertRaises(LibredeskUnavailable):
+                client._auth()
 
     def test_repeated_libredesk_open_status_events_reopen_ticket_each_time(self):
         ticket_id = self.add_ticket(status="new")
@@ -372,6 +504,25 @@ class TicketLifecycleTests(unittest.TestCase):
         with self.db.connect() as conn:
             ticket = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()
         self.assertEqual(ticket["status"], "in_progress")
+
+    def test_reconciliation_reads_message_pages_until_a_short_page(self):
+        ticket_id = self.add_ticket(status="new")
+        now = iso(NOW)
+        with self.db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO ticket_integrations (ticket_id, provider, conversation_id, conversation_uuid, contact_email, created_at, updated_at) VALUES (?, 'libredesk', 1, 'conversation-1', 'member@example.com', ?, ?)",
+                (ticket_id, now, now),
+            )
+        first_page = [
+            {"uuid": f"message-{index}", "conversation_uuid": "conversation-1", "text_content": str(index)}
+            for index in range(100)
+        ]
+        second_page = [{"uuid": "message-100", "conversation_uuid": "conversation-1", "text_content": "100"}]
+        libredesk = ReconcileLibreDesk("Open", "2026-08-07T00:00:02Z", {1: first_page, 2: second_page})
+        reconcile_once(self.db, self.settings, libredesk)
+        self.assertEqual(libredesk.requested_pages, [1, 2])
+        with self.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM integration_inbox").fetchone()[0], 101)
 
     def test_wizarr_reply_to_requires_one_exact_jellyfin_username_and_valid_email(self):
         lookup = WizarrEmailLookup(self.settings)
