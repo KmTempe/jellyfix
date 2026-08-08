@@ -4,6 +4,13 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    allow:
+      - dependency-name: "coverage"
+      - dependency-name: "fastapi"
+      - dependency-name: "httpx"
+      - dependency-name: "pydantic"
+      - dependency-name: "starlette"
+      - dependency-name: "uvicorn"
 
   - package-ecosystem: docker
     directory: "/backend"

@@ -126,9 +126,15 @@ jobs:
           [[ "$(docker inspect --format '{{.HostConfig.ReadonlyRootfs}}' jellyfix-ci)" == "true" ]]
           [[ "$(docker inspect --format '{{.State.Running}}' jellyfix-ci)" == "true" ]]
 
-      - name: Show logs on failure
+      - name: Show container logs on failure
         if: failure()
-        run: docker logs jellyfix-ci
+        shell: bash
+        run: |
+          if docker inspect jellyfix-ci >/dev/null 2>&1; then
+            docker logs jellyfix-ci
+          else
+            echo "The smoke-test container was not created; inspect the build and start steps above."
+          fi
 
       - name: Remove smoke-test container
         if: always()
