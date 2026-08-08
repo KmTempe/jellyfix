@@ -52,6 +52,8 @@
     let currentItemId = null;
     let meCache = null;
     let observerTimer = null;
+    let refreshRetryTimer = null;
+    let refreshRetryCount = 0;
     let refreshInFlight = false;
     let openTicket = null;
     let ticketPollTimer = null;
@@ -864,12 +866,21 @@
         await injectHistoryMenu();
         await injectAdminMenu();
         const container = document.querySelector(".mainDetailButtons");
-        if (!container) return;
+        if (!container) {
+            scheduleRefreshRetry();
+            return;
+        }
         const itemId = currentPageItemId();
-        if (!itemId) return;
+        if (!itemId) {
+            scheduleRefreshRetry();
+            return;
+        }
         currentItemId = itemId;
         const button = ensureTicketButton(container, itemId);
-        if (button.dataset.itemId === itemId && button.dataset.jellyfixLoaded === "true") return;
+        if (button.dataset.itemId === itemId && button.dataset.jellyfixLoaded === "true") {
+            refreshRetryCount = 0;
+            return;
+        }
 
         try {
             refreshInFlight = true;
@@ -880,6 +891,7 @@
             if (currentPageItemId() === itemId && button.isConnected) {
                 renderTicketButton(button, itemId, ticket);
                 button.dataset.jellyfixLoaded = "true";
+                refreshRetryCount = 0;
             }
         } catch (_err) {}
         finally {
@@ -887,8 +899,23 @@
         }
     }
 
+    function scheduleRefreshRetry() {
+        if (!window.location.hash.includes("#/details?")) return;
+        if (refreshRetryTimer || refreshRetryCount >= 15) return;
+        refreshRetryCount += 1;
+        refreshRetryTimer = window.setTimeout(() => {
+            refreshRetryTimer = null;
+            refreshButton();
+        }, 300);
+    }
+
     function scheduleRefresh() {
         window.clearTimeout(observerTimer);
+        if (refreshRetryTimer) {
+            window.clearTimeout(refreshRetryTimer);
+            refreshRetryTimer = null;
+        }
+        refreshRetryCount = 0;
         observerTimer = window.setTimeout(refreshButton, 350);
     }
 
@@ -901,6 +928,7 @@
             resetAbort();
             stopTicketPolling();
             currentItemId = null;
+            refreshRetryCount = 0;
         }
         if (document.querySelector(".mainDetailButtons") || document.querySelector(".mainDrawer-content")) {
             scheduleRefresh();
