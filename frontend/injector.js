@@ -99,7 +99,7 @@
             .jellyfix-csat-title { display:block; margin-bottom:6px; font-weight:600; }
             .jellyfix-csat-action { display:block; width:max-content; margin-top:10px; color:#fff; background:#0284c7; border-radius:5px; padding:7px 10px; text-decoration:none; }
             #btn-jellyfix { margin-right:.5em; display:flex; align-items:center; justify-content:center; }
-            #btn-admin-tickets { margin-top:5px; }
+            #btn-jellyfix-history:focus, #btn-admin-tickets:focus { outline:2px solid #00a4dc; outline-offset:-2px; background:rgba(255,255,255,.12); }
             .jf-badge-new { color:#ff5252 !important; }
             .jf-badge-work { color:#ffbb33 !important; }
             .jf-badge-ok { color:#00c851 !important; }
@@ -715,6 +715,7 @@
         showModal(TEXT.history);
         try {
             await loadMe();
+            if (!meCache?.is_admin) throw new Error("Admin required");
             const content = document.getElementById("jf-content");
             let cursor = null;
             let loading = false;
@@ -760,59 +761,82 @@
         }
     }
 
-    async function injectHistoryMenu() {
-        try {
-            await loadMe();
-        } catch (_err) {
-            return;
-        }
-        if (document.getElementById("btn-jellyfix-history")) return;
-        const link = document.createElement("a");
-        link.id = "btn-jellyfix-history";
-        link.href = "#";
-        link.setAttribute("role", "button");
-        link.className = "navMenuOption";
-        const icon = el("span", "navMenuOptionIcon material-icons", "history");
-        icon.setAttribute("aria-hidden", "true");
-        const text = el("span", "navMenuOptionText", TEXT.history);
-        link.append(icon, text);
-        link.addEventListener("click", (event) => {
-            event.preventDefault();
-            showHistory();
-        });
-        const dashboardLink = document.querySelector('a[href*="dashboard"]');
-        if (dashboardLink?.parentNode) dashboardLink.parentNode.insertBefore(link, dashboardLink.nextSibling);
-        else (document.querySelector(".mainDrawer-content") || document.querySelector(".mainDrawer-scrollContainer"))?.appendChild(link);
+    const checkedProfileMenus = new WeakMap();
+
+    function removeProfileEntries() {
+        document.getElementById("btn-jellyfix-history")?.remove();
+        document.getElementById("btn-admin-tickets")?.remove();
     }
 
-    async function injectAdminMenu() {
+    async function injectProfileMenu() {
+        // Identify the user menu by its Settings destination, not translated labels.
+        const settings = document.querySelector('[role="menu"] a[href="#/mypreferencesmenu"]');
+        const profileMenu = settings?.closest('[role="menu"]');
+        const menu = profileMenu || document.querySelector(".mainDrawer-content") ||
+            document.querySelector(".mainDrawer-scrollContainer");
+        const token = getToken();
+        if (!token) {
+            removeProfileEntries();
+            return;
+        }
+        if (!menu || checkedProfileMenus.get(menu) === token) return;
+        checkedProfileMenus.set(menu, token);
+        removeProfileEntries();
         try {
-            await loadMe();
+            const user = await api("/me", { signal: new AbortController().signal });
+            if (!menu.isConnected || token !== getToken()) return;
+            meCache = user;
+            if (!user.is_admin) {
+                removeProfileEntries();
+                return;
+            }
+            let anchor = settings || menu.querySelector('a[href*="dashboard"]');
+            for (const [id, label, iconName, open] of [
+                ["btn-jellyfix-history", TEXT.history, "history", showHistory],
+                ["btn-admin-tickets", TEXT.manager, "build", showManager]
+            ]) {
+                if (menu.querySelector(`#${id}`)) continue;
+                const item = el(profileMenu ? "li" : "a", profileMenu ? settings.className : "navMenuOption");
+                item.id = id;
+                item.setAttribute("role", profileMenu ? "menuitem" : "button");
+                item.tabIndex = profileMenu ? -1 : 0;
+                if (!profileMenu) item.href = "#";
+                const icon = el("span", profileMenu ? "material-icons" : "navMenuOptionIcon material-icons", iconName);
+                icon.setAttribute("aria-hidden", "true");
+                if (profileMenu) icon.style.marginRight = "16px";
+                item.append(icon, el("span", profileMenu ? null : "navMenuOptionText", label));
+                item.addEventListener("keydown", (event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                        event.preventDefault();
+                        item.click();
+                    }
+                });
+                item.addEventListener("click", async (event) => {
+                    event.preventDefault();
+                    // Let Jellyfin close its own React menu and restore focus.
+                    if (profileMenu) item.dispatchEvent(new KeyboardEvent("keydown", {
+                        key: "Escape", code: "Escape", bubbles: true
+                    }));
+                    try {
+                        const currentToken = getToken();
+                        const currentUser = await api("/me", { signal: new AbortController().signal });
+                        if (currentToken !== getToken() || !currentUser.is_admin) {
+                            removeProfileEntries();
+                            return;
+                        }
+                        meCache = currentUser;
+                        open();
+                    } catch (_err) {
+                        removeProfileEntries();
+                    }
+                });
+                if (anchor) anchor.after(item);
+                else menu.appendChild(item);
+                anchor = item;
+            }
         } catch (_err) {
-            return;
+            removeProfileEntries();
         }
-        const existing = document.getElementById("btn-admin-tickets");
-        if (!meCache?.is_admin) {
-            if (existing) existing.remove();
-            return;
-        }
-        if (existing) return;
-        const link = document.createElement("a");
-        link.id = "btn-admin-tickets";
-        link.href = "#";
-        link.setAttribute("role", "button");
-        link.className = "navMenuOption";
-        const icon = el("span", "navMenuOptionIcon material-icons", "build");
-        icon.setAttribute("aria-hidden", "true");
-        const text = el("span", "navMenuOptionText", TEXT.manager);
-        link.append(icon, text);
-        link.addEventListener("click", (event) => {
-            event.preventDefault();
-            showManager();
-        });
-        const dashboardLink = document.querySelector('a[href*="dashboard"]');
-        if (dashboardLink?.parentNode) dashboardLink.parentNode.insertBefore(link, dashboardLink.nextSibling);
-        else (document.querySelector(".mainDrawer-content") || document.querySelector(".mainDrawer-scrollContainer"))?.appendChild(link);
     }
 
     function statusIcon(status) {
@@ -863,8 +887,6 @@
 
     async function refreshButton() {
         if (refreshInFlight) return;
-        await injectHistoryMenu();
-        await injectAdminMenu();
         const container = document.querySelector(".mainDetailButtons");
         if (!container) {
             scheduleRefreshRetry();
@@ -923,6 +945,7 @@
     ensureModal();
     let lastHref = window.location.href;
     const observer = new MutationObserver(() => {
+        injectProfileMenu();
         if (window.location.href !== lastHref) {
             lastHref = window.location.href;
             resetAbort();
@@ -938,5 +961,6 @@
     document.addEventListener("visibilitychange", () => {
         if (!document.hidden && openTicket) refreshOpenTicket(openTicket.id);
     });
+    injectProfileMenu();
     window.setTimeout(refreshButton, 800);
 })();
