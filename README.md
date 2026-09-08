@@ -79,59 +79,6 @@ flowchart LR
     class Outbox,Inbox database;
 ```
 
-JellyFix is attached to both `jellyfix_default` and `libredesk_libredesk`. The thick arrows are private container-to-container traffic over `libredesk_libredesk`; no public LibreDesk route is required.
-
-### Network topology
-
-```mermaid
-flowchart TB
-    Browser["&lt;&lt;client&gt;&gt;<br/>Jellyfin Web UI<br/><b>injector.js</b>"]
-    Gateway["&lt;&lt;public endpoint&gt;&gt;<br/>Jellyfin host / reverse proxy<br/><b>HTTPS :443</b>"]
-
-    Browser <-->|"browser HTTPS"| Gateway
-
-    subgraph PublicRoutes["Same-origin routes"]
-        JellyfinWeb["&lt;&lt;route&gt;&gt;<br/><b>/web</b><br/>Jellyfin UI"]
-        JellyFixRoute["&lt;&lt;route&gt;&gt;<br/><b>/jellyfix/api/v1</b><br/>ticket API"]
-    end
-
-    Gateway --> JellyfinWeb
-    Gateway --> JellyFixRoute
-
-    subgraph JellyFixNetwork["Docker network: jellyfix_default"]
-        JellyFix["&lt;&lt;container&gt;&gt;<br/>JellyFix<br/><b>jellyfix:8000</b>"]
-        Database[("&lt;&lt;volume&gt;&gt;<br/>SQLite data<br/><b>/data</b>")]
-        JellyFix --> Database
-    end
-
-    JellyFixRoute -->|"proxied API request"| JellyFix
-
-    JellyfinAPI["&lt;&lt;server API&gt;&gt;<br/>Jellyfin<br/><b>/Users/Me</b>"]
-    WizarrAPI["&lt;&lt;server API&gt;&gt;<br/>Wizarr<br/><b>/api/users?username=</b>"]
-
-    JellyFix -->|"token validation"| JellyfinAPI
-    JellyFix -->|"reporter email lookup"| WizarrAPI
-
-    subgraph LibreDeskNetwork["Docker network: libredesk_libredesk"]
-        LibreDesk["&lt;&lt;container&gt;&gt;<br/>LibreDesk<br/><b>libredesk_app:9000</b>"]
-    end
-
-    JellyFix <-->|"private container bridge<br/>REST sync → · signed webhook ←"| LibreDesk
-    LibreDesk -.->|"configured inbox delivery"| Email["&lt;&lt;external service&gt;&gt;<br/>Email provider"]
-    Email -.-> Reporter["&lt;&lt;user&gt;&gt;<br/>Reporter"]
-
-    classDef client fill:#e8f1ff,stroke:#2563eb,stroke-width:2px,color:#111827;
-    classDef service fill:#eefbf3,stroke:#16803c,stroke-width:2px,color:#111827;
-    classDef external fill:#fff7e6,stroke:#b7791f,stroke-width:2px,color:#111827;
-    classDef database fill:#f4ecff,stroke:#7c3aed,stroke-width:2px,color:#111827;
-    class Browser,Reporter client;
-    class Gateway,JellyfinWeb,JellyFixRoute,JellyFix,LibreDesk service;
-    class JellyfinAPI,WizarrAPI,Email external;
-    class Database database;
-```
-
-Browser traffic stays on the Jellyfin HTTPS origin. JellyFix performs authentication, Wizarr lookup, and LibreDesk synchronization as server-to-server requests; only the LibreDesk bridge uses the shared private Docker network.
-
 ## Ticket lifecycle
 
 ### Creation and delivery
