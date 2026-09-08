@@ -11,13 +11,13 @@ requires-python = ">=3.14"
 dependencies = [
     "fastapi==0.141.1",
     "httpx==0.28.1",
-    "pydantic==2.13.4",
-    "starlette==1.4.1",
-    "uvicorn==0.52.1",
+    "pydantic==2.13.5",
+    "starlette==1.6.0",
+    "uvicorn==0.52.4",
 ]
 
 [project.optional-dependencies]
-dev = ["coverage==7.15.2"]
+dev = ["coverage==7.16.0"]
 
 [tool.setuptools]
 package-dir = {"" = "backend"}
