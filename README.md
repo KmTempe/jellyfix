@@ -9,7 +9,7 @@ JellyFix adds issue reporting and ticket history to Jellyfin Web. A small browse
 - Server-verified Jellyfin identity and administrator permissions
 - One active ticket per user and media item, with unlimited resolved history
 - Five-minute cooldown after resolution with `429` and `Retry-After`
-- Administrator-only My Ticket History and Ticket Manager in the Jellyfin profile dropdown, with sidebar support for older versions
+- User-scoped My Ticket History and administrator-only Ticket Manager in the Jellyfin profile dropdown, with sidebar support for older versions
 - Durable SQLite queues for Wizarr and LibreDesk outages
 - Bidirectional LibreDesk messages and status synchronization
 - Safe CSAT links and SQLite migration backups

@@ -715,7 +715,6 @@
         showModal(TEXT.history);
         try {
             await loadMe();
-            if (!meCache?.is_admin) throw new Error("Admin required");
             const content = document.getElementById("jf-content");
             let cursor = null;
             let loading = false;
@@ -786,15 +785,10 @@
             const user = await api("/me", { signal: new AbortController().signal });
             if (!menu.isConnected || token !== getToken()) return;
             meCache = user;
-            if (!user.is_admin) {
-                removeProfileEntries();
-                return;
-            }
             let anchor = settings || menu.querySelector('a[href*="dashboard"]');
-            for (const [id, label, iconName, open] of [
-                ["btn-jellyfix-history", TEXT.history, "history", showHistory],
-                ["btn-admin-tickets", TEXT.manager, "build", showManager]
-            ]) {
+            const entries = [["btn-jellyfix-history", TEXT.history, "history", showHistory]];
+            if (user.is_admin) entries.push(["btn-admin-tickets", TEXT.manager, "build", showManager]);
+            for (const [id, label, iconName, open] of entries) {
                 if (menu.querySelector(`#${id}`)) continue;
                 const item = el(profileMenu ? "li" : "a", profileMenu ? settings.className : "navMenuOption");
                 item.id = id;
@@ -820,7 +814,7 @@
                     try {
                         const currentToken = getToken();
                         const currentUser = await api("/me", { signal: new AbortController().signal });
-                        if (currentToken !== getToken() || !currentUser.is_admin) {
+                        if (currentToken !== getToken() || (id === "btn-admin-tickets" && !currentUser.is_admin)) {
                             removeProfileEntries();
                             return;
                         }

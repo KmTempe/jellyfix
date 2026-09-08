@@ -67,13 +67,15 @@ test("admin menu inserts both items once, and checks again on remount", async ()
     assert.equal(state.nodes.length, 3);
 });
 
-test("non-admin and failed authorization never expose entries", async () => {
-    for (const fails of [false, true]) {
-        const state = fixture();
-        state.response = () => { if (fails) throw new Error("unavailable"); return { is_admin: false }; };
-        await state.inject();
-        assert.equal(state.nodes.length, 1);
-    }
+test("non-admin users get history but not the manager", async () => {
+    const state = fixture();
+    state.response = () => ({ is_admin: false });
+    await state.inject();
+    assert.deepEqual(state.nodes.map(node => node.id), [undefined, "btn-jellyfix-history"]);
+    const failed = fixture();
+    failed.response = () => { throw new Error("unavailable"); };
+    await failed.inject();
+    assert.equal(failed.nodes.length, 1);
 });
 
 test("late authorization cannot populate a detached menu or a different session", async () => {
@@ -130,14 +132,14 @@ test("legacy sidebar supports placement with and without Dashboard", async () =>
     }
 });
 
-test("persistent sidebar removes admin entries when the session changes", async () => {
+test("persistent sidebar removes manager when the session changes to a member", async () => {
     const state = fixture();
     state.mount(true);
     await state.inject();
     state.token = "member-session";
     state.user = { is_admin: false };
     await state.inject();
-    assert.equal(state.nodes.length, 1);
+    assert.equal(state.nodes.length, 2);
     state.token = "another-admin-session";
     state.user = { is_admin: true };
     await state.inject();
